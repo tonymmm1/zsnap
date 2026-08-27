@@ -1,0 +1,233 @@
+use std::path::PathBuf;
+
+use anyhow::{Result, bail};
+use chrono::Utc;
+use clap::{Parser, Subcommand, ValueEnum};
+use serde::Serialize;
+use zsnap::config::Config;
+use zsnap::executor::{ExecutionReport, execute};
+use zsnap::lock::RunLock;
+use zsnap::planner::{Plan, build_plan, resolve_datasets};
+use zsnap::zfs::Inventory;
+
+#[derive(Debug, Parser)]
+#[command(name = "zsnap", version, about = "Fast, policy-driven ZFS snapshots")]
+struct Cli {
+    /// Path to the TOML configuration file.
+    #[arg(short, long, default_value = "/etc/zsnap/zsnap.toml", global = true)]
+    config: PathBuf,
+
+    /// Emit machine-readable JSON.
+    #[arg(long, global = true)]
+    json: bool,
+
+    /// Include command-level execution details.
+    #[arg(short, long, global = true)]
+    verbose: bool,
+
+    #[command(subcommand)]
+    command: Commands,
+}
+
+#[derive(Debug, Subcommand)]
+enum Commands {
+    /// Take due snapshots, then prune expired snapshots.
+    Run {
+        /// Show commands without changing ZFS state or running hooks.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Take due snapshots without pruning.
+    Snapshot {
+        /// Show commands without changing ZFS state or running hooks.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Prune expired snapshots without taking new snapshots.
+    Prune {
+        /// Show commands without changing ZFS state or running hooks.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Inspect current state and print the actions that would be performed.
+    Plan {
+        /// Restrict the plan to one action type.
+        #[arg(long, value_enum, default_value_t = PlanScope::All)]
+        scope: PlanScope,
+    },
+    /// Validate the configuration, optionally probing ZFS as well.
+    Check {
+        /// Also discover ZFS state and resolve recursive datasets.
+        #[arg(long)]
+        probe: bool,
+    },
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum PlanScope {
+    All,
+    Snapshot,
+    Prune,
+}
+
+#[derive(Serialize)]
+struct CheckOutput {
+    status: &'static str,
+    configured_datasets: usize,
+    resolved_datasets: Option<usize>,
+    pools: Option<usize>,
+}
+
+fn main() -> Result<()> {
+    let cli = Cli::parse();
+    let config = Config::load(&cli.config)?;
+
+    if let Commands::Check { probe } = &cli.command {
+        return check(&config, *probe, cli.json);
+    }
+
+    let (scope, dry_run, execute_actions) = match cli.command {
+        Commands::Run { dry_run } => (PlanScope::All, dry_run, true),
+        Commands::Snapshot { dry_run } => (PlanScope::Snapshot, dry_run, true),
+        Commands::Prune { dry_run } => (PlanScope::Prune, dry_run, true),
+        Commands::Plan { scope } => (scope, true, false),
+        Commands::Check { .. } => unreachable!(),
+    };
+
+    // Hold the lock across discovery, planning, and mutation so two invocations cannot race.
+    let _lock = if execute_actions && !dry_run {
+        Some(RunLock::acquire(&config.settings.lock_file)?)
+    } else {
+        None
+    };
+    let inventory =
+        Inventory::discover(&config.settings, config.datasets.keys().map(String::as_str))?;
+    let resolved = resolve_datasets(&config, &inventory)?;
+    let mut plan = build_plan(&config, &inventory, &resolved, Utc::now())?;
+    filter_plan(&mut plan, scope);
+
+    if !execute_actions {
+        print_plan(&plan, cli.json)?;
+        return Ok(());
+    }
+
+    let report = execute(&plan, &config.settings, dry_run, cli.verbose)?;
+    print_report(&plan, &report, cli.json, cli.verbose)?;
+    if !report.succeeded() {
+        bail!("{} operation(s) failed", report.errors.len());
+    }
+    Ok(())
+}
+
+fn check(config: &Config, probe: bool, json: bool) -> Result<()> {
+    let (resolved_datasets, pools) = if probe {
+        let inventory =
+            Inventory::discover(&config.settings, config.datasets.keys().map(String::as_str))?;
+        let resolved = resolve_datasets(config, &inventory)?;
+        (Some(resolved.len()), Some(inventory.pools.len()))
+    } else {
+        (None, None)
+    };
+    let output = CheckOutput {
+        status: "ok",
+        configured_datasets: config.datasets.len(),
+        resolved_datasets,
+        pools,
+    };
+    if json {
+        println!("{}", serde_json::to_string_pretty(&output)?);
+    } else if probe {
+        println!(
+            "configuration is valid; {} configured dataset(s) resolve to {} dataset(s) across {} pool(s)",
+            config.datasets.len(),
+            resolved_datasets.unwrap_or_default(),
+            pools.unwrap_or_default()
+        );
+    } else {
+        println!(
+            "configuration is valid ({} configured dataset(s))",
+            config.datasets.len()
+        );
+    }
+    Ok(())
+}
+
+fn filter_plan(plan: &mut Plan, scope: PlanScope) {
+    match scope {
+        PlanScope::All => {}
+        PlanScope::Snapshot => plan.retain_snapshots_only(),
+        PlanScope::Prune => plan.retain_prunes_only(),
+    }
+}
+
+fn print_plan(plan: &Plan, json: bool) -> Result<()> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(plan)?);
+        return Ok(());
+    }
+    println!(
+        "plan: create {} snapshot(s), prune {} snapshot(s), {} pool(s)",
+        plan.snapshot_count(),
+        plan.prune_count(),
+        plan.pools().len()
+    );
+    for action in &plan.snapshots {
+        let recursion = if action.recursive { " recursively" } else { "" };
+        println!(
+            "  CREATE [{}] {}{} @ {}",
+            action.pool,
+            action.dataset,
+            recursion,
+            action.names.join(", ")
+        );
+    }
+    for action in &plan.prunes {
+        println!(
+            "  PRUNE  [{}] {} @ {}",
+            action.pool,
+            action.dataset,
+            action.names.join(", ")
+        );
+    }
+    for dataset in &plan.deferred_prune_datasets {
+        println!("  DEFER  pruning {dataset}: pool capacity is below prune_defer");
+    }
+    Ok(())
+}
+
+fn print_report(plan: &Plan, report: &ExecutionReport, json: bool, verbose: bool) -> Result<()> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(report)?);
+        return Ok(());
+    }
+    if verbose || report.dry_run {
+        for line in &report.logs {
+            println!("{line}");
+        }
+    }
+    for error in &report.errors {
+        eprintln!("ERROR: {error}");
+    }
+    if report.dry_run {
+        println!(
+            "dry run: would create {} snapshot(s) and prune {} snapshot(s) across {} pool(s)",
+            plan.snapshot_count(),
+            plan.prune_count(),
+            plan.pools().len()
+        );
+    } else {
+        println!(
+            "created {} snapshot(s), pruned {} snapshot(s) across {} pool(s)",
+            report.snapshots_created,
+            report.snapshots_pruned,
+            plan.pools().len()
+        );
+    }
+    if report.prunes_skipped_after_snapshot_failure > 0 {
+        eprintln!(
+            "safety stop: skipped {} prune(s) after a snapshot failure",
+            report.prunes_skipped_after_snapshot_failure
+        );
+    }
+    Ok(())
+}

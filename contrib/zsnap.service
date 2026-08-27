@@ -1,0 +1,16 @@
+[Unit]
+Description=Policy-driven ZFS snapshots with zsnap
+Wants=zfs.target
+After=zfs.target
+ConditionPathExists=/etc/zsnap/zsnap.toml
+
+[Service]
+Type=oneshot
+Environment=TZ=UTC
+RuntimeDirectory=zsnap
+RuntimeDirectoryMode=0750
+ExecStart=/usr/local/sbin/zsnap --config /etc/zsnap/zsnap.toml run
+Nice=10
+IOSchedulingClass=idle
+UMask=0077
+TimeoutStartSec=infinity

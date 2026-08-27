@@ -1,0 +1,29 @@
+[package]
+name = "zsnap"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Fast, policy-driven ZFS snapshot management"
+license = "MIT"
+keywords = ["zfs", "snapshot", "backup", "sanoid"]
+categories = ["command-line-utilities", "filesystem"]
+
+[dependencies]
+anyhow = "1.0"
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
+clap = { version = "4.5", features = ["derive"] }
+fs2 = "0.4"
+rayon = "1.10"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+toml = "0.8"
+
+[dev-dependencies]
+tempfile = "3.20"
+
+[profile.release]
+codegen-units = 1
+lto = "fat"
+opt-level = 3
+panic = "abort"
+strip = "symbols"

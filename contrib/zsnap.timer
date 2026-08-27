@@ -1,0 +1,12 @@
+[Unit]
+Description=Run zsnap every 15 minutes
+
+[Timer]
+OnCalendar=*:0/15
+AccuracySec=1min
+RandomizedDelaySec=30s
+Persistent=true
+Unit=zsnap.service
+
+[Install]
+WantedBy=timers.target

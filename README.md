@@ -1,0 +1,258 @@
+# zsnap
+
+`zsnap` is a policy-driven ZFS snapshot manager written in Rust. It takes the
+useful snapshot lifecycle ideas from [Sanoid](https://github.com/jimsalterjrs/sanoid),
+uses an actual TOML configuration schema, and compiles to one executable with no
+Perl or runtime package dependencies. It manages snapshot creation and retention;
+replication is intentionally outside its scope.
+
+The initial implementation is usable now, but it deserves normal staging before
+being trusted with irreplaceable pools. Start with `zsnap plan`, inspect every
+proposed deletion, and test against a disposable ZFS pool.
+
+## What it does
+
+- Creates frequent, hourly, daily, weekly, monthly, and yearly snapshots on UTC
+  schedules.
+- Applies ordered templates, recursive dataset policies, and per-dataset overrides.
+- Supports both individually managed descendants and atomic `zfs snapshot -r` trees.
+- Uses Sanoid-compatible names such as
+  `autosnap_2026-08-27_14:00:00_hourly`.
+- Retains at least the configured number of each snapshot class and only removes
+  snapshots older than that class's retention window.
+- Runs different zpools concurrently, with a configurable concurrency cap.
+- Supports pre/post snapshot and pruning hooks with timeouts and Sanoid-compatible
+  environment aliases.
+- Provides text or JSON plans, non-mutating dry runs, and a process-wide lock.
+
+## Why it is efficient
+
+`zsnap` discovers datasets and pool capacity once per invocation, and limits its
+single snapshot scan to pools referenced by the configuration rather than repeatedly
+querying ZFS per dataset or scanning unrelated pools. It then builds the entire plan
+in memory. For execution it:
+
+1. assigns one independent worker to each zpool;
+2. combines unhooked snapshots from the same pool into bounded, atomic multi-dataset
+   `zfs snapshot` calls;
+3. combines snapshot deletions for each dataset with ZFS's comma-list syntax; and
+4. serializes commands within a pool by default, avoiding extra queueing and disk
+   contention on the same vdevs.
+
+Hooks require dataset-specific ordering, so a dataset with hooks is automatically
+removed from batching. `max_parallel_pools = 0` means all pools may run at once;
+set a positive number to cap that concurrency.
+
+### Why channel programs are not the default
+
+OpenZFS channel programs are appealing for very large prune sets: one pool-scoped
+Lua invocation can call `zfs.sync.destroy` repeatedly and report failures for each
+candidate. They are a possible future opt-in execution backend, after measurement
+on pools where subprocess overhead is material.
+
+They are not a better general default here. Channel programs require root, operate
+on only one pool, and impose instruction and memory ceilings. Their administrative
+operations are isolated from concurrent administration, but a fatal resource error
+can leave a program partially applied rather than rolling it back. Snapshotting
+would also require separate `snapshot` and ownership-property calls inside Lua,
+whereas the current `zfs snapshot -o ... dataset@snap...` command creates the
+batched snapshots atomically with their ownership marker. Pool-level concurrency
+still has to be orchestrated outside ZFS, which the Rust executor already does.
+
+## Safety model
+
+New snapshots receive the ZFS user property `org.zsnap:managed=yes`. By default,
+`zsnap` only deletes snapshots carrying that property. Existing Sanoid-compatible
+snapshots still count as recent snapshots when scheduling, preventing duplicates,
+but they are not deleted unless `prune_sanoid_snapshots = true` is explicitly set.
+
+Additional guardrails:
+
+- `plan` and `--dry-run` never mutate ZFS or execute hooks.
+- A locked run covers discovery, planning, snapshotting, and pruning.
+- If snapshot creation or a snapshot hook fails for a pool, all pruning for that
+  pool is skipped in the same run.
+- A retention value is both an approximate age window and a minimum count. For
+  example, `daily = 30` only prunes a daily older than 30 days when more than 30
+  dailies exist.
+- Snapshot names must match the configured prefix and a known period suffix.
+- Hook commands are argv arrays. They are executed directly, never through an
+  implicit shell.
+
+## Build
+
+Requirements are Rust 1.85 or newer and OpenZFS command-line tools at runtime.
+
+```console
+cargo build --release
+cargo test --all-targets
+./target/release/zsnap --help
+```
+
+The release profile enables full LTO and strips symbols. To produce a static Linux
+binary when a musl toolchain is available:
+
+```console
+rustup target add x86_64-unknown-linux-musl
+make static
+```
+
+The resulting binary is
+`target/x86_64-unknown-linux-musl/release/zsnap`. ZFS itself remains an external
+system facility: `zsnap` invokes the installed `zfs` and `zpool` tools.
+
+## Install with systemd
+
+The installer builds a release binary, installs it to `/usr/local/sbin/zsnap`,
+installs `/etc/zsnap/zsnap.toml` only when that file does not already exist, and
+installs the systemd units. It enables the 15-minute timer only after the configured
+datasets pass a read-only ZFS probe:
+
+```console
+./install.sh
+```
+
+Use `./install.sh --no-enable` to install without starting the timer. Review the
+configuration and preview the live plan before enabling it:
+
+```console
+sudoedit /etc/zsnap/zsnap.toml
+sudo zsnap check --probe
+sudo zsnap plan
+sudo make enable
+systemctl list-timers zsnap.timer
+```
+
+`./install.sh --static` builds and installs the musl-linked static binary. Install
+the Rust target first with `rustup target add x86_64-unknown-linux-musl`.
+
+The equivalent Make targets are:
+
+```console
+make release test lint
+sudo make install
+sudo make enable
+```
+
+`PREFIX`, `BINDIR`, `SYSCONFDIR`, `SYSTEMD_UNIT_DIR`, and packaging `DESTDIR` are
+overridable. The supplied service assumes the default `/usr/local/sbin` and `/etc`
+locations. `make uninstall` disables the timer and removes the binary and units but
+deliberately preserves the user-edited configuration.
+
+## Configure
+
+See [`config.example.toml`](config.example.toml) for a fully annotated example.
+The core shape is:
+
+```toml
+version = 1
+
+[settings]
+snapshot_prefix = "autosnap"
+max_parallel_pools = 0
+prune_sanoid_snapshots = false
+
+[templates.production]
+autosnap = true
+autoprune = true
+frequently = 0
+hourly = 36
+daily = 30
+weekly = 4
+monthly = 3
+yearly = 0
+
+[datasets."tank/data"]
+use_templates = ["production"]
+recursive = true
+
+[datasets."tank/data/vm".policy]
+hourly = 12
+```
+
+Templates listed in `use_templates` are applied left to right; later values win.
+An explicit child starts from its inherited recursive policy, then applies its
+templates and local `[...policy]` values.
+
+### Recursion modes
+
+- `recursive = false` manages only that dataset.
+- `recursive = true` expands the policy to every current descendant and snapshots
+  each one individually. Explicit child sections are allowed.
+- `recursive = "zfs"` takes consistent tree-wide snapshots with `zfs snapshot -r`.
+  Explicit child sections beneath that root are rejected because they would imply
+  snapshot exclusions ZFS cannot honor atomically.
+- `process_children_only = true` is supported with `recursive = true` and leaves
+  the named parent unchanged.
+
+### Schedules and retention
+
+Schedules use UTC, which avoids daylight-saving duplicate and missing hours.
+Defaults intentionally track Sanoid's general policy: hourly at minute 0, daily at
+23:59, weekly Monday at 23:30, monthly on day 1, and yearly on January 1. Days of
+the week use ISO numbering (`1 = Monday`, `7 = Sunday`). Monthly days are limited
+to 1 through 28 so every configured date exists.
+
+Setting a retention class to `0` disables new snapshots of that class and prunes
+all owned snapshots in that class when `autoprune = true`. `prune_defer = 70`
+defers pruning while pool capacity is below 70 percent.
+
+### Hooks
+
+Hooks are optional arrays containing an executable and arguments:
+
+```toml
+[datasets."tank/database".policy]
+pre_snapshot_script = ["/usr/local/libexec/zsnap/db-freeze", "--timeout", "5"]
+post_snapshot_script = ["/usr/local/libexec/zsnap/db-thaw"]
+script_timeout = 10
+no_inconsistent_snapshot = true
+force_post_snapshot_script = true
+```
+
+The hook environment contains `ZSNAP_SCRIPT`, `ZSNAP_TARGET`, `ZSNAP_TARGETS`,
+`ZSNAP_SNAPNAME`, `ZSNAP_SNAPNAMES`, `ZSNAP_TYPES`, and `ZSNAP_PRE_FAILURE`.
+Equivalent `SANOID_*` variables are also set to ease hook migration. Set a hook to
+`["/bin/sh", "-c", "..."]` only when shell behavior is explicitly needed.
+
+## Commands
+
+```console
+# Syntax-only validation; does not require ZFS.
+zsnap --config ./config.example.toml check
+
+# Validate dataset names and recursive expansion against this host.
+sudo zsnap check --probe
+
+# Print all due creates/deletes. Add --json for structured output.
+sudo zsnap plan
+
+# Exercise the exact executor path without mutation or hooks.
+sudo zsnap run --dry-run --verbose
+
+# Run both phases, or isolate one phase.
+sudo zsnap run
+sudo zsnap snapshot
+sudo zsnap prune
+```
+
+## Migrating from Sanoid
+
+Keep `snapshot_prefix = "autosnap"`. Existing Sanoid snapshots will suppress
+unnecessary duplicate snapshots. Initially leave `prune_sanoid_snapshots = false`,
+run `zsnap plan`, and confirm policy expansion and newly created snapshots. Enable
+that setting only when you intentionally want `zsnap` to prune compatible legacy
+snapshots that lack its ownership property.
+
+Sanoid configuration files are INI-style despite their TOML-like appearance; they
+are not accepted directly. Translate sections to `[templates.<name>]` and quoted
+`[datasets."pool/path"]` TOML tables.
+
+## Project scope and provenance
+
+This is an independent Rust implementation informed by Sanoid's public behavior
+and documentation. It does not contain Sanoid's Perl source. Snapshot replication,
+Nagios-compatible health checks, bookmarks, holds, and send/receive orchestration
+are not part of version 0.1.0.
+
+Licensed under MIT. See [`LICENSE`](LICENSE).

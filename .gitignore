@@ -1,0 +1,6 @@
+/target/
+*.log
+*.swp
+*.tmp
+.idea/
+.vscode/
