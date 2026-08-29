@@ -1,4 +1,8 @@
-# zsnap
+<p align="center">
+  <img src="assets/zsnap-logo.png" alt="zsnap crab mascot guarding a stack of snapshot disks" width="260">
+</p>
+
+<h1 align="center">zsnap</h1>
 
 `zsnap` is a policy-driven ZFS snapshot manager written in Rust. It takes the
 useful snapshot lifecycle ideas from [Sanoid](https://github.com/jimsalterjrs/sanoid),

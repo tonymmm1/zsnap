@@ -10,10 +10,14 @@ case "${ID:-}" in
     apt-get install -y --no-install-recommends build-essential ca-certificates curl
     ;;
   fedora|rocky|rhel|centos)
+    set -- gcc make ca-certificates tar gzip
+    if ! command -v curl >/dev/null 2>&1; then
+      set -- "$@" curl-minimal
+    fi
     if command -v dnf >/dev/null 2>&1; then
-      dnf install -y gcc make ca-certificates curl tar gzip
+      dnf install -y "$@"
     else
-      microdnf install -y gcc make ca-certificates curl tar gzip
+      microdnf install -y "$@"
     fi
     ;;
   alpine)

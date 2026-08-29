@@ -22,6 +22,25 @@ jobs:
       - run: cargo test --all-targets --locked
       - run: make static
       - run: file target/x86_64-unknown-linux-musl/release/zsnap | grep -E 'static-pie linked|statically linked'
+      - name: Validate shell scripts
+        run: >-
+          sh -n
+          install.sh
+          ci/package-release.sh
+          ci/test-distro.sh
+          contrib/zsnap.openrc
+          contrib/zsnap.periodic
+      - name: Validate staged static installation
+        run: >-
+          make install-static-none
+          DESTDIR="$RUNNER_TEMP/zsnap-root"
+      - name: Validate release archive
+        env:
+          DIST_DIR: ${{ runner.temp }}/zsnap-dist
+        run: |
+          ./ci/package-release.sh x86_64-unknown-linux-musl 0.0.0-ci
+          cd "$DIST_DIR"
+          sha256sum --check --strict *.sha256
 
   distro-source-build:
     runs-on: ubuntu-24.04

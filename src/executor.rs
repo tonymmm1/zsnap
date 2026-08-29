@@ -625,23 +625,8 @@ mod tests {
 
     #[test]
     fn snapshot_failure_stops_pruning_for_that_pool() {
-        let directory = tempdir().unwrap();
-        let script = directory.path().join("fake-zfs");
-        let log = directory.path().join("calls.log");
-        fs::write(
-            &script,
-            format!(
-                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\n[ \"$1\" != snapshot ]\n",
-                log.display()
-            ),
-        )
-        .unwrap();
-        let mut permissions = fs::metadata(&script).unwrap().permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(&script, permissions).unwrap();
-
         let settings = Settings {
-            zfs_command: script,
+            zfs_command: "false".into(),
             ..Settings::default()
         };
         let policy = Policy::default();
@@ -666,9 +651,21 @@ mod tests {
         assert!(!report.succeeded());
         assert_eq!(report.prunes_skipped_after_snapshot_failure, 1);
         assert_eq!(report.snapshots_pruned, 0);
-        let calls = fs::read_to_string(log).unwrap();
-        assert_eq!(calls.lines().count(), 1);
-        assert!(calls.starts_with("snapshot"));
+        let commands = report
+            .logs
+            .iter()
+            .filter(|log| log.contains("] RUN "))
+            .collect::<Vec<_>>();
+        assert_eq!(commands.len(), 1);
+        assert!(commands[0].contains(" RUN \"false\" \"snapshot\" "));
+        assert!(
+            report
+                .logs
+                .iter()
+                .any(|log| log.contains("skipped 1 prune"))
+        );
+        assert_eq!(report.errors.len(), 1);
+        assert!(report.errors[0].contains("failed with"));
     }
 
     #[test]

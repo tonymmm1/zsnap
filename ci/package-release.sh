@@ -47,9 +47,10 @@ cleanup() {
 trap cleanup 0 HUP INT TERM
 
 package_dir="$staging/$archive_base"
-mkdir -p "$package_dir/contrib"
+mkdir -p "$package_dir/assets" "$package_dir/contrib"
 install -m 755 "$binary" "$package_dir/zsnap"
 install -m 644 README.md LICENSE config.example.toml "$package_dir/"
+install -m 644 assets/zsnap-logo.png "$package_dir/assets/"
 install -m 644 \
   contrib/webhooks.env.example \
   contrib/zsnap.service \

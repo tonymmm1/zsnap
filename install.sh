@@ -118,9 +118,17 @@ install_build_dependencies() {
     run_privileged apt-get update
     run_privileged apt-get install -y build-essential curl ca-certificates
   elif command -v dnf >/dev/null 2>&1; then
-    run_privileged dnf install -y gcc make curl ca-certificates
+    set -- gcc make ca-certificates
+    if ! command -v curl >/dev/null 2>&1; then
+      set -- "$@" curl
+    fi
+    run_privileged dnf install -y "$@"
   elif command -v yum >/dev/null 2>&1; then
-    run_privileged yum install -y gcc make curl ca-certificates
+    set -- gcc make ca-certificates
+    if ! command -v curl >/dev/null 2>&1; then
+      set -- "$@" curl
+    fi
+    run_privileged yum install -y "$@"
   elif command -v apk >/dev/null 2>&1; then
     run_privileged apk add --no-cache build-base curl ca-certificates
   elif command -v pacman >/dev/null 2>&1; then
