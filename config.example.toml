@@ -19,6 +19,47 @@ zpool_command = "zpool"
 # is due, but are not deleted unless this migration switch is explicitly enabled.
 prune_sanoid_snapshots = false
 
+[notifications]
+# Webhooks are delivered after the ZFS lock is released. Each endpoint has its
+# own retry loop, and different endpoints are sent concurrently up to this cap.
+enabled = true
+max_parallel = 4
+timeout_seconds = 10
+max_attempts = 3
+retry_backoff_milliseconds = 500
+
+# HTTPS is required by default. Leave this false for Internet webhooks.
+allow_insecure_http = false
+
+# Normally a webhook outage is logged but does not make a successful snapshot
+# run fail. Enable this only if monitoring delivery is part of job success.
+fail_on_error = false
+
+# Override the host label in messages. If omitted, HOSTNAME or /etc/hostname is used.
+# hostname = "storage-01"
+
+# URLs may be stored directly in this mode-0600 TOML file or read from an
+# environment variable. The installed systemd service optionally reads
+# /etc/zsnap/webhooks.env for url_env values. Failure-only is the default.
+#
+# [[notifications.webhooks]]
+# name = "primary-flock"
+# kind = "flock"
+# url_env = "ZSNAP_FLOCK_WEBHOOK"
+# events = ["failure"]
+#
+# [[notifications.webhooks]]
+# name = "storage-discord"
+# kind = "discord"
+# url = "https://discord.com/api/webhooks/REPLACE/REPLACE"
+# events = ["failure", "success"]
+#
+# [[notifications.webhooks]]
+# name = "operations-slack"
+# kind = "slack"
+# url = "https://hooks.slack.com/services/REPLACE/REPLACE/REPLACE"
+# events = ["failure"]
+
 [templates.production]
 autosnap = true
 autoprune = true

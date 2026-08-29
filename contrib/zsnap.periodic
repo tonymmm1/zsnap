@@ -1,0 +1,10 @@
+#!/bin/sh
+
+# Alpine's default crond runs /etc/periodic/15min via run-parts.
+if [ -r /etc/zsnap/webhooks.env ]; then
+  set -a
+  # shellcheck disable=SC1091
+  . /etc/zsnap/webhooks.env
+  set +a
+fi
+exec /usr/local/sbin/zsnap --config /etc/zsnap/zsnap.toml run

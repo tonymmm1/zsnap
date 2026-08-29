@@ -1,4 +1,5 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -17,8 +18,124 @@ pub struct Config {
     #[serde(default)]
     pub settings: Settings,
     #[serde(default)]
+    pub notifications: Notifications,
+    #[serde(default)]
     pub templates: BTreeMap<String, PolicyPatch>,
     pub datasets: BTreeMap<String, DatasetConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Notifications {
+    pub enabled: bool,
+    pub hostname: Option<String>,
+    pub max_parallel: usize,
+    pub timeout_seconds: u64,
+    pub max_attempts: u32,
+    pub retry_backoff_milliseconds: u64,
+    pub allow_insecure_http: bool,
+    pub fail_on_error: bool,
+    pub webhooks: Vec<WebhookConfig>,
+}
+
+impl Default for Notifications {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            hostname: None,
+            max_parallel: 4,
+            timeout_seconds: 10,
+            max_attempts: 3,
+            retry_backoff_milliseconds: 500,
+            allow_insecure_http: false,
+            fail_on_error: false,
+            webhooks: Vec::new(),
+        }
+    }
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WebhookConfig {
+    pub name: String,
+    pub kind: WebhookKind,
+    #[serde(default)]
+    pub url: Option<SecretString>,
+    #[serde(default)]
+    pub url_env: Option<String>,
+    #[serde(default = "default_webhook_events")]
+    pub events: Vec<WebhookEvent>,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+}
+
+impl fmt::Debug for WebhookConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("WebhookConfig")
+            .field("name", &self.name)
+            .field("kind", &self.kind)
+            .field("url", &self.url)
+            .field("url_env", &self.url_env)
+            .field("events", &self.events)
+            .field("enabled", &self.enabled)
+            .finish()
+    }
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(transparent)]
+pub struct SecretString(String);
+
+impl SecretString {
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+}
+
+impl fmt::Debug for SecretString {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("[redacted]")
+    }
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum WebhookKind {
+    Discord,
+    Flock,
+    Slack,
+}
+
+impl fmt::Display for WebhookKind {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let value = match self {
+            Self::Discord => "discord",
+            Self::Flock => "flock",
+            Self::Slack => "slack",
+        };
+        formatter.write_str(value)
+    }
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "lowercase")]
+pub enum WebhookEvent {
+    Failure,
+    Success,
+}
+
+fn default_webhook_events() -> Vec<WebhookEvent> {
+    vec![WebhookEvent::Failure]
+}
+
+const fn default_true() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -354,6 +471,7 @@ impl Config {
             "prune_batch_size must be greater than zero"
         );
         validate_prefix(&self.settings.snapshot_prefix)?;
+        self.notifications.validate()?;
 
         for (name, patch) in &self.templates {
             ensure!(!name.trim().is_empty(), "template names cannot be empty");
@@ -414,6 +532,106 @@ impl Config {
     }
 }
 
+impl Notifications {
+    pub fn validate(&self) -> Result<()> {
+        ensure!(
+            self.max_parallel > 0,
+            "notifications.max_parallel must be greater than zero"
+        );
+        ensure!(
+            (1..=60).contains(&self.timeout_seconds),
+            "notifications.timeout_seconds must be between 1 and 60"
+        );
+        ensure!(
+            (1..=5).contains(&self.max_attempts),
+            "notifications.max_attempts must be between 1 and 5"
+        );
+        ensure!(
+            self.retry_backoff_milliseconds <= 10_000,
+            "notifications.retry_backoff_milliseconds must not exceed 10000"
+        );
+        if let Some(hostname) = &self.hostname {
+            ensure!(
+                !hostname.trim().is_empty(),
+                "notifications.hostname cannot be empty"
+            );
+            ensure!(
+                !hostname.contains(['\n', '\r', '\0']),
+                "notifications.hostname cannot contain line breaks or NUL bytes"
+            );
+        }
+
+        let mut names = BTreeSet::new();
+        for webhook in &self.webhooks {
+            let context = format!("notification webhook {:?}", webhook.name);
+            ensure!(
+                !webhook.name.trim().is_empty(),
+                "webhook names cannot be empty"
+            );
+            ensure!(
+                !webhook.name.contains(['\n', '\r', '\0']),
+                "{context}: name cannot contain line breaks or NUL bytes"
+            );
+            ensure!(
+                names.insert(webhook.name.as_str()),
+                "duplicate notification webhook name {:?}",
+                webhook.name
+            );
+            ensure!(
+                webhook.url.is_some() ^ webhook.url_env.is_some(),
+                "{context}: configure exactly one of url or url_env"
+            );
+            ensure!(
+                !webhook.events.is_empty(),
+                "{context}: events cannot be empty"
+            );
+            let unique_events: BTreeSet<_> = webhook.events.iter().copied().collect();
+            ensure!(
+                unique_events.len() == webhook.events.len(),
+                "{context}: events cannot contain duplicates"
+            );
+            if let Some(url) = &webhook.url {
+                validate_webhook_url(url.expose(), self.allow_insecure_http, &context)?;
+            }
+            if let Some(variable) = &webhook.url_env {
+                ensure!(
+                    is_portable_environment_name(variable),
+                    "{context}: url_env must be a portable environment variable name"
+                );
+            }
+        }
+        Ok(())
+    }
+}
+
+pub(crate) fn validate_webhook_url(
+    url: &str,
+    allow_insecure_http: bool,
+    context: &str,
+) -> Result<()> {
+    let uri = url
+        .parse::<ureq::http::Uri>()
+        .map_err(|_| anyhow::anyhow!("{context}: invalid webhook URL"))?;
+    let scheme = uri
+        .scheme_str()
+        .ok_or_else(|| anyhow::anyhow!("{context}: webhook URL must include a scheme"))?;
+    ensure!(
+        uri.authority().is_some(),
+        "{context}: webhook URL must include a host"
+    );
+    ensure!(
+        scheme == "https" || (allow_insecure_http && scheme == "http"),
+        "{context}: webhook URL must use HTTPS (set notifications.allow_insecure_http = true only for a trusted HTTP endpoint)"
+    );
+    Ok(())
+}
+
+fn is_portable_environment_name(name: &str) -> bool {
+    let mut characters = name.chars();
+    matches!(characters.next(), Some('_' | 'A'..='Z' | 'a'..='z'))
+        && characters.all(|character| matches!(character, '_' | 'A'..='Z' | 'a'..='z' | '0'..='9'))
+}
+
 fn validate_prefix(prefix: &str) -> Result<()> {
     ensure!(!prefix.is_empty(), "snapshot_prefix cannot be empty");
     ensure!(
@@ -462,6 +680,16 @@ fn validate_hook(command: &[String], context: &str, field: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn config_with_notifications(notification_toml: &str) -> String {
+        format!(
+            r#"
+version = 1
+{notification_toml}
+[datasets."tank/data"]
+"#
+        )
+    }
 
     #[test]
     fn parses_real_toml_and_merges_templates_in_order() {
@@ -512,5 +740,79 @@ recursive = "zfs"
                 .to_string()
                 .contains("atomic recursive")
         );
+    }
+
+    #[test]
+    fn parses_typed_webhook_configuration_with_failure_default() {
+        let raw = config_with_notifications(
+            r#"
+[notifications]
+max_parallel = 3
+
+[[notifications.webhooks]]
+name = "operations"
+kind = "flock"
+url_env = "ZSNAP_FLOCK_WEBHOOK"
+"#,
+        );
+        let config: Config = toml::from_str(&raw).unwrap();
+        config.validate().unwrap();
+        let webhook = &config.notifications.webhooks[0];
+        assert_eq!(webhook.kind, WebhookKind::Flock);
+        assert_eq!(webhook.events, vec![WebhookEvent::Failure]);
+        assert_eq!(config.notifications.max_parallel, 3);
+    }
+
+    #[test]
+    fn rejects_unknown_toml_keys_and_webhook_types() {
+        let unknown_key = config_with_notifications(
+            r#"
+[notifications]
+timeot_seconds = 10
+"#,
+        );
+        assert!(toml::from_str::<Config>(&unknown_key).is_err());
+
+        let unknown_kind = config_with_notifications(
+            r#"
+[[notifications.webhooks]]
+name = "operations"
+kind = "teams"
+url = "https://example.invalid/hook"
+"#,
+        );
+        assert!(toml::from_str::<Config>(&unknown_kind).is_err());
+    }
+
+    #[test]
+    fn validates_webhook_url_sources_and_transport_security() {
+        let both_sources = config_with_notifications(
+            r#"
+[[notifications.webhooks]]
+name = "operations"
+kind = "slack"
+url = "https://example.invalid/hook"
+url_env = "ZSNAP_SLACK_WEBHOOK"
+"#,
+        );
+        let config: Config = toml::from_str(&both_sources).unwrap();
+        assert!(
+            config
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("exactly one")
+        );
+
+        let insecure = config_with_notifications(
+            r#"
+[[notifications.webhooks]]
+name = "operations"
+kind = "discord"
+url = "http://example.invalid/hook"
+"#,
+        );
+        let config: Config = toml::from_str(&insecure).unwrap();
+        assert!(config.validate().unwrap_err().to_string().contains("HTTPS"));
     }
 }

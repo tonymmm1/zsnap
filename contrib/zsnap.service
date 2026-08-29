@@ -1,12 +1,13 @@
 [Unit]
 Description=Policy-driven ZFS snapshots with zsnap
-Wants=zfs.target
-After=zfs.target
+Wants=zfs.target network-online.target
+After=zfs.target network-online.target
 ConditionPathExists=/etc/zsnap/zsnap.toml
 
 [Service]
 Type=oneshot
 Environment=TZ=UTC
+EnvironmentFile=-/etc/zsnap/webhooks.env
 RuntimeDirectory=zsnap
 RuntimeDirectoryMode=0750
 ExecStart=/usr/local/sbin/zsnap --config /etc/zsnap/zsnap.toml run

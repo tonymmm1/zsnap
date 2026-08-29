@@ -614,4 +614,54 @@ mod tests {
         assert_eq!(calls.lines().count(), 1);
         assert!(calls.starts_with("snapshot"));
     }
+
+    #[test]
+    fn independent_pools_reach_the_executor_at_the_same_time() {
+        let directory = tempdir().unwrap();
+        let script = directory.path().join("fake-zfs");
+        let state = directory.path().join("state");
+        fs::create_dir(&state).unwrap();
+        fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\ncase \"$*\" in\n  *tank/*) own=tank; other=backup ;;\n  *backup/*) own=backup; other=tank ;;\n  *) exit 64 ;;\nesac\n: > '{state}/'$own\nattempt=0\nwhile [ ! -e '{state}/'$other ]; do\n  attempt=$((attempt + 1))\n  [ \"$attempt\" -lt 100 ] || exit 70\n  sleep 0.01\ndone\n",
+                state = state.display()
+            ),
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&script).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&script, permissions).unwrap();
+
+        let settings = Settings {
+            zfs_command: script,
+            max_parallel_pools: 2,
+            ..Settings::default()
+        };
+        let policy = Policy::default();
+        let plan = Plan {
+            snapshots: vec![
+                SnapshotAction {
+                    pool: "tank".to_owned(),
+                    dataset: "tank/data".to_owned(),
+                    recursive: false,
+                    names: vec!["autosnap_tank_hourly".to_owned()],
+                    kinds: vec![],
+                    policy: policy.clone(),
+                },
+                SnapshotAction {
+                    pool: "backup".to_owned(),
+                    dataset: "backup/data".to_owned(),
+                    recursive: false,
+                    names: vec!["autosnap_backup_hourly".to_owned()],
+                    kinds: vec![],
+                    policy,
+                },
+            ],
+            ..Plan::default()
+        };
+        let report = execute(&plan, &settings, false, false).unwrap();
+        assert!(report.succeeded(), "{:?}", report.errors);
+        assert_eq!(report.snapshots_created, 2);
+    }
 }

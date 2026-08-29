@@ -1,0 +1,57 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  quality:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@1.85.0
+        with:
+          components: clippy, rustfmt
+          targets: x86_64-unknown-linux-musl
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --all-targets --all-features --locked -- -D warnings
+      - run: cargo test --all-targets --locked
+      - run: make static
+      - run: file target/x86_64-unknown-linux-musl/release/zsnap | grep -E 'static-pie linked|statically linked'
+
+  distro-source-build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Ubuntu 24.04
+            image: ubuntu:24.04
+          - name: Debian 13
+            image: debian:13
+          - name: Fedora 44
+            image: fedora:44
+          - name: CentOS Stream 9
+            image: quay.io/centos/centos:stream9
+          - name: RHEL UBI 9
+            image: registry.access.redhat.com/ubi9/ubi:latest
+          - name: Rocky Linux 9
+            image: rockylinux:9
+          - name: Alpine 3.22
+            image: alpine:3.22
+          - name: Arch Linux
+            image: archlinux:base
+    name: ${{ matrix.name }}
+    steps:
+      - uses: actions/checkout@v6
+      - name: Build and test in distribution container
+        run: >-
+          docker run --rm
+          -v "$GITHUB_WORKSPACE:/source:ro"
+          "${{ matrix.image }}"
+          sh /source/ci/test-distro.sh

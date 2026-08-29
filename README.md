@@ -3,7 +3,8 @@
 `zsnap` is a policy-driven ZFS snapshot manager written in Rust. It takes the
 useful snapshot lifecycle ideas from [Sanoid](https://github.com/jimsalterjrs/sanoid),
 uses an actual TOML configuration schema, and compiles to one executable with no
-Perl or runtime package dependencies. It manages snapshot creation and retention;
+Perl or language runtime. OpenZFS's `zfs` and `zpool` commands remain the only
+runtime facilities it invokes. It manages snapshot creation and retention;
 replication is intentionally outside its scope.
 
 The initial implementation is usable now, but it deserves normal staging before
@@ -21,6 +22,8 @@ proposed deletion, and test against a disposable ZFS pool.
 - Retains at least the configured number of each snapshot class and only removes
   snapshots older than that class's retention window.
 - Runs different zpools concurrently, with a configurable concurrency cap.
+- Sends bounded-parallel failure/success notifications to Flock, Discord, and
+  Slack incoming webhooks.
 - Supports pre/post snapshot and pruning hooks with timeouts and Sanoid-compatible
   environment aliases.
 - Provides text or JSON plans, non-mutating dry runs, and a process-wide lock.
@@ -42,6 +45,10 @@ in memory. For execution it:
 Hooks require dataset-specific ordering, so a dataset with hooks is automatically
 removed from batching. `max_parallel_pools = 0` means all pools may run at once;
 set a positive number to cap that concurrency.
+
+Webhook delivery has its own bounded worker set and starts only after the ZFS run
+lock has been released. HTTPS uses rustls with bundled Mozilla roots, so webhooks
+do not introduce an OpenSSL runtime dependency.
 
 ### Why channel programs are not the default
 
@@ -81,7 +88,8 @@ Additional guardrails:
 
 ## Build
 
-Requirements are Rust 1.85 or newer and OpenZFS command-line tools at runtime.
+Requirements are Rust 1.85 or newer, a C linker/compiler for the bundled TLS crypto
+during compilation, and OpenZFS command-line tools at runtime.
 
 ```console
 cargo build --release
@@ -101,7 +109,45 @@ The resulting binary is
 `target/x86_64-unknown-linux-musl/release/zsnap`. ZFS itself remains an external
 system facility: `zsnap` invokes the installed `zfs` and `zpool` tools.
 
-## Install with systemd
+For this checkout, whose Rust toolchain is managed by `mise`, the equivalent local
+commands are:
+
+```console
+mise exec rust@1.85.0 -- cargo build --release --locked
+mise exec rust@1.85.0 -- cargo test --all-targets --locked
+./target/release/zsnap --config ./config.example.toml check
+```
+
+## Automated build and install
+
+This command installs build prerequisites, bootstraps the pinned Rust toolchain with
+official rustup, detects systemd or OpenRC, and enables scheduling only after a
+read-only ZFS probe succeeds:
+
+```console
+./install.sh --install-deps --bootstrap-rust
+```
+
+`--install-deps` supports `apt`, `dnf`/`yum`, `apk`, and `pacman`. It deliberately
+does not install ZFS because ZFS packaging and kernel-module choices are
+distribution-specific. Install OpenZFS first and ensure both `zfs` and `zpool` are
+on root's `PATH`.
+
+- Ubuntu, Debian, Fedora, RHEL-family distributions, CentOS, Rocky Linux, and
+  Arch normally select systemd and its 15-minute timer.
+- Alpine normally selects OpenRC and `/etc/periodic/15min`.
+- `--init systemd`, `--init openrc`, or `--init none` overrides detection.
+- `--no-enable` installs without activating a recurring schedule.
+
+Add `--static` to build with Rust's self-contained musl target. The installer adds
+the target with rustup and explicitly supplies the host C compiler for the bundled
+TLS crypto, so this path does not depend on distro-specific musl compiler package
+names. A static binary is the broadest distribution option because it does not
+inherit the builder's glibc version. CI builds and tests in Ubuntu, Debian, Fedora,
+CentOS Stream, RHEL UBI, Rocky Linux, Alpine, and Arch containers, plus a
+static-musl build.
+
+### systemd
 
 The installer builds a release binary, installs it to `/usr/local/sbin/zsnap`,
 installs `/etc/zsnap/zsnap.toml` only when that file does not already exist, and
@@ -123,25 +169,60 @@ sudo make enable
 systemctl list-timers zsnap.timer
 ```
 
-`./install.sh --static` builds and installs the musl-linked static binary. Install
-the Rust target first with `rustup target add x86_64-unknown-linux-musl`.
+`./install.sh --static` builds and installs a musl-linked static binary and asks
+rustup to add the current architecture's musl target.
 
 The equivalent Make targets are:
 
 ```console
 make release test lint
+make verify-static
 sudo make install
 sudo make enable
 ```
 
-`PREFIX`, `BINDIR`, `SYSCONFDIR`, `SYSTEMD_UNIT_DIR`, and packaging `DESTDIR` are
-overridable. The supplied service assumes the default `/usr/local/sbin` and `/etc`
-locations. `make uninstall` disables the timer and removes the binary and units but
-deliberately preserves the user-edited configuration.
+For Alpine/OpenRC, use `sudo make install-openrc` followed by
+`sudo make enable-openrc`. The latter installs the periodic runner and ensures
+`crond` starts. `install-none` installs only the binary and configuration.
+
+`PREFIX`, `BINDIR`, `SYSCONFDIR`, `SYSTEMD_UNIT_DIR`, `OPENRC_INIT_DIR`,
+`PERIODIC_DIR`, and packaging `DESTDIR` are overridable. The supplied scheduler
+files assume the default `/usr/local/sbin` and `/etc` locations. `make uninstall`
+handles systemd; `make uninstall-openrc` handles OpenRC. Both deliberately preserve
+the user-edited configuration and webhook environment file.
+
+## CI and releases
+
+Every push and pull request runs formatting, Clippy with warnings denied, the full
+test suite, a verified static-musl build, and source builds inside Ubuntu, Debian,
+Fedora, CentOS Stream, RHEL UBI, Rocky Linux, Alpine, and Arch containers.
+
+Pushing an annotated `vMAJOR.MINOR.PATCH` tag runs the tests again and creates a
+GitHub release containing static x86-64 and ARM64 archives plus SHA-256 checksum
+files. Each architecture is compiled and smoke-tested on a matching native GitHub
+runner. The tag must exactly match the package version in `Cargo.toml`:
+
+```console
+git tag -a v0.1.0 -m "zsnap 0.1.0"
+git push origin v0.1.0
+```
+
+The release archives contain the executable, example configuration, systemd and
+OpenRC scheduling files, README, and license. A downloaded binary can be installed
+directly; ZFS command-line tools are still required at runtime:
+
+```console
+sha256sum --check zsnap-0.1.0-x86_64-unknown-linux-musl.tar.gz.sha256
+tar -xzf zsnap-0.1.0-x86_64-unknown-linux-musl.tar.gz
+sudo install -m755 zsnap-0.1.0-x86_64-unknown-linux-musl/zsnap /usr/local/sbin/zsnap
+```
 
 ## Configure
 
 See [`config.example.toml`](config.example.toml) for a fully annotated example.
+Parsing is typed and strict: unknown tables/keys, unknown webhook kinds/events,
+invalid schedules, duplicate webhook names, and unsafe URL choices are rejected.
+`zsnap check` validates syntax and semantics without requiring ZFS.
 The core shape is:
 
 ```toml
@@ -173,6 +254,70 @@ hourly = 12
 Templates listed in `use_templates` are applied left to right; later values win.
 An explicit child starts from its inherited recursive policy, then applies its
 templates and local `[...policy]` values.
+
+### Notifications
+
+Notifications are optional. Webhooks default to failure-only; add `"success"`
+when routine success messages are wanted. Flock and Slack receive their documented
+`text` payload, while Discord receives `content` with mention parsing disabled.
+
+```toml
+[notifications]
+max_parallel = 4
+timeout_seconds = 10
+max_attempts = 3
+retry_backoff_milliseconds = 500
+fail_on_error = false
+
+[[notifications.webhooks]]
+name = "storage-flock"
+kind = "flock"
+url_env = "ZSNAP_FLOCK_WEBHOOK"
+events = ["failure"]
+
+[[notifications.webhooks]]
+name = "storage-discord"
+kind = "discord"
+url = "https://discord.com/api/webhooks/REPLACE/REPLACE"
+events = ["failure", "success"]
+
+[[notifications.webhooks]]
+name = "storage-slack"
+kind = "slack"
+url = "https://hooks.slack.com/services/REPLACE/REPLACE/REPLACE"
+events = ["failure"]
+```
+
+Each webhook is independent. `max_parallel` bounds simultaneous requests;
+timeouts are per attempt; and transient network errors, HTTP 408/425/429, and 5xx
+responses are retried with exponential backoff capped at 30 seconds. Delivery
+failures go to stderr but do not mask the ZFS result unless `fail_on_error = true`.
+
+Webhook URLs are bearer secrets. The installer creates the TOML configuration and
+`/etc/zsnap/webhooks.env` with mode `0600`. Direct `url` values are supported, but
+`url_env` keeps them out of the main configuration. Put simple, quoted assignments
+in the environment file:
+
+```sh
+ZSNAP_FLOCK_WEBHOOK='https://api.flock.com/hooks/sendMessage/REPLACE'
+```
+
+The systemd unit reads it as an optional `EnvironmentFile`; the OpenRC and Alpine
+periodic runners source it as a root-owned shell environment file. HTTPS is mandatory
+unless `allow_insecure_http = true` is explicitly set for a trusted local receiver.
+Errors and debug representations redact configured URLs.
+
+Test every enabled endpoint through the real delivery path without touching ZFS:
+
+```console
+sudo zsnap notify-test --message "storage notifications configured"
+sudo zsnap --json notify-test
+```
+
+Provider setup details are in the official
+[Flock](https://support.flock.com/hc/en-us/articles/360006943354-Incoming-webhooks),
+[Discord](https://docs.discord.com/developers/resources/webhook), and
+[Slack](https://api.slack.com/messaging/webhooks) incoming-webhook documentation.
 
 ### Recursion modes
 
@@ -234,6 +379,9 @@ sudo zsnap run --dry-run --verbose
 sudo zsnap run
 sudo zsnap snapshot
 sudo zsnap prune
+
+# Exercise all enabled notification targets without querying ZFS.
+sudo zsnap notify-test
 ```
 
 ## Migrating from Sanoid

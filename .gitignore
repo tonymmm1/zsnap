@@ -1,4 +1,5 @@
 /target/
+/dist/
 *.log
 *.swp
 *.tmp

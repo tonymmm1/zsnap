@@ -1,12 +1,14 @@
 use std::path::PathBuf;
+use std::time::Instant;
 
-use anyhow::{Result, bail};
+use anyhow::{Result, anyhow, bail};
 use chrono::Utc;
 use clap::{Parser, Subcommand, ValueEnum};
 use serde::Serialize;
 use zsnap::config::Config;
 use zsnap::executor::{ExecutionReport, execute};
 use zsnap::lock::RunLock;
+use zsnap::notification::{self, DeliveryEvent, NotificationReport};
 use zsnap::planner::{Plan, build_plan, resolve_datasets};
 use zsnap::zfs::Inventory;
 
@@ -61,6 +63,12 @@ enum Commands {
         #[arg(long)]
         probe: bool,
     },
+    /// Send a test message to every enabled webhook.
+    NotifyTest {
+        /// Text appended to the test notification.
+        #[arg(long, default_value = "webhook delivery is working")]
+        message: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -78,6 +86,13 @@ struct CheckOutput {
     pools: Option<usize>,
 }
 
+#[derive(Debug)]
+struct RunSummary {
+    snapshots_created: usize,
+    snapshots_pruned: usize,
+    pools: usize,
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let config = Config::load(&cli.config)?;
@@ -85,13 +100,69 @@ fn main() -> Result<()> {
     if let Commands::Check { probe } = &cli.command {
         return check(&config, *probe, cli.json);
     }
+    if let Commands::NotifyTest { message } = &cli.command {
+        return notify_test(&config, message, cli.json);
+    }
 
-    let (scope, dry_run, execute_actions) = match cli.command {
-        Commands::Run { dry_run } => (PlanScope::All, dry_run, true),
-        Commands::Snapshot { dry_run } => (PlanScope::Snapshot, dry_run, true),
-        Commands::Prune { dry_run } => (PlanScope::Prune, dry_run, true),
-        Commands::Plan { scope } => (scope, true, false),
-        Commands::Check { .. } => unreachable!(),
+    let notification_command = mutating_command(&cli.command);
+    let started = Instant::now();
+    let result = run_zfs_command(&cli, &config);
+    let mut notification_error = None;
+    if let Some(command) = notification_command {
+        let (event, detail) = match &result {
+            Ok(summary) => (
+                DeliveryEvent::Success,
+                format!(
+                    "Created {} snapshot(s), pruned {} snapshot(s), {} pool(s).",
+                    summary.snapshots_created, summary.snapshots_pruned, summary.pools
+                ),
+            ),
+            Err(error) => (DeliveryEvent::Failure, format!("Error: {error:#}")),
+        };
+        let status = if event == DeliveryEvent::Success {
+            "SUCCESS"
+        } else {
+            "FAILURE"
+        };
+        let message = format!(
+            "zsnap {command} {status} on {}\nDuration: {:.3}s\n{detail}",
+            notification::hostname(&config.notifications),
+            started.elapsed().as_secs_f64(),
+        );
+        match notification::deliver(&config.notifications, event, &message) {
+            Ok(report) => {
+                print_notification_errors(&report);
+                if !report.succeeded() {
+                    notification_error = Some(format!(
+                        "{} of {} notification delivery attempt(s) failed",
+                        report.failed(),
+                        report.attempted
+                    ));
+                }
+            }
+            Err(error) => {
+                eprintln!("NOTIFICATION ERROR: {error:#}");
+                notification_error = Some(error.to_string());
+            }
+        }
+    }
+
+    match result {
+        Err(error) => Err(error),
+        Ok(_) if config.notifications.fail_on_error && notification_error.is_some() => {
+            Err(anyhow!(notification_error.unwrap()))
+        }
+        Ok(_) => Ok(()),
+    }
+}
+
+fn run_zfs_command(cli: &Cli, config: &Config) -> Result<RunSummary> {
+    let (scope, dry_run, execute_actions) = match &cli.command {
+        Commands::Run { dry_run } => (PlanScope::All, *dry_run, true),
+        Commands::Snapshot { dry_run } => (PlanScope::Snapshot, *dry_run, true),
+        Commands::Prune { dry_run } => (PlanScope::Prune, *dry_run, true),
+        Commands::Plan { scope } => (*scope, true, false),
+        Commands::Check { .. } | Commands::NotifyTest { .. } => unreachable!(),
     };
 
     // Hold the lock across discovery, planning, and mutation so two invocations cannot race.
@@ -102,21 +173,83 @@ fn main() -> Result<()> {
     };
     let inventory =
         Inventory::discover(&config.settings, config.datasets.keys().map(String::as_str))?;
-    let resolved = resolve_datasets(&config, &inventory)?;
-    let mut plan = build_plan(&config, &inventory, &resolved, Utc::now())?;
+    let resolved = resolve_datasets(config, &inventory)?;
+    let mut plan = build_plan(config, &inventory, &resolved, Utc::now())?;
     filter_plan(&mut plan, scope);
 
     if !execute_actions {
         print_plan(&plan, cli.json)?;
-        return Ok(());
+        return Ok(RunSummary {
+            snapshots_created: 0,
+            snapshots_pruned: 0,
+            pools: plan.pools().len(),
+        });
     }
 
     let report = execute(&plan, &config.settings, dry_run, cli.verbose)?;
     print_report(&plan, &report, cli.json, cli.verbose)?;
     if !report.succeeded() {
-        bail!("{} operation(s) failed", report.errors.len());
+        bail!(
+            "{} operation(s) failed after creating {} and pruning {} snapshot(s) across {} pool(s)",
+            report.errors.len(),
+            report.snapshots_created,
+            report.snapshots_pruned,
+            plan.pools().len()
+        );
+    }
+    Ok(RunSummary {
+        snapshots_created: report.snapshots_created,
+        snapshots_pruned: report.snapshots_pruned,
+        pools: plan.pools().len(),
+    })
+}
+
+fn mutating_command(command: &Commands) -> Option<&'static str> {
+    match command {
+        Commands::Run { dry_run: false } => Some("run"),
+        Commands::Snapshot { dry_run: false } => Some("snapshot"),
+        Commands::Prune { dry_run: false } => Some("prune"),
+        _ => None,
+    }
+}
+
+fn notify_test(config: &Config, text: &str, json: bool) -> Result<()> {
+    let message = format!(
+        "zsnap TEST on {}\n{}",
+        notification::hostname(&config.notifications),
+        text
+    );
+    let report = notification::deliver(&config.notifications, DeliveryEvent::Test, &message)?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        println!(
+            "webhook test: delivered {} of {} target(s); {} skipped",
+            report.delivered, report.attempted, report.skipped
+        );
+    }
+    print_notification_errors(&report);
+    if report.attempted == 0 {
+        bail!("no enabled notification webhooks are configured");
+    }
+    if !report.succeeded() {
+        bail!(
+            "{} webhook test delivery attempt(s) failed",
+            report.failed()
+        );
     }
     Ok(())
+}
+
+fn print_notification_errors(report: &NotificationReport) {
+    for delivery in &report.deliveries {
+        if let Some(error) = &delivery.error {
+            eprintln!(
+                "NOTIFICATION ERROR [{}:{} after {} attempt(s)]: {error}",
+                delivery.kind, delivery.target, delivery.attempts
+            );
+        }
+    }
 }
 
 fn check(config: &Config, probe: bool, json: bool) -> Result<()> {

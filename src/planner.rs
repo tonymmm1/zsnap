@@ -399,7 +399,7 @@ mod tests {
     use chrono::TimeZone;
 
     use super::*;
-    use crate::config::{DatasetConfig, PolicyPatch, Recursion, Settings};
+    use crate::config::{DatasetConfig, Notifications, PolicyPatch, Recursion, Settings};
     use crate::zfs::Pool;
 
     fn test_config() -> Config {
@@ -429,6 +429,7 @@ mod tests {
         Config {
             version: 1,
             settings: Settings::default(),
+            notifications: Notifications::default(),
             templates,
             datasets,
         }
