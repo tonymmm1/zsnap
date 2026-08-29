@@ -218,7 +218,7 @@ pub fn build_plan(
                 .iter()
                 .filter(|snapshot| {
                     snapshot_kind(&config.settings.snapshot_prefix, &snapshot.name) == Some(kind)
-                        && (snapshot.managed || config.settings.prune_sanoid_snapshots)
+                        && snapshot.managed
                 })
                 .copied()
                 .collect();
@@ -505,7 +505,7 @@ mod tests {
     }
 
     #[test]
-    fn unmanaged_compatible_snapshots_are_not_pruned_by_default() {
+    fn unmanaged_compatible_snapshots_are_never_pruned() {
         let config = test_config();
         let mut inventory = test_inventory();
         let now = Utc.with_ymd_and_hms(2026, 8, 27, 12, 10, 0).unwrap();

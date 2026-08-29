@@ -10,6 +10,8 @@ use crate::model::SnapshotKind;
 
 const DEFAULT_PREFIX: &str = "autosnap";
 const DEFAULT_LOCK_FILE: &str = "/run/zsnap/zsnap.lock";
+const MAX_SNAPSHOT_BATCH_SIZE: usize = 256;
+const MAX_PRUNE_BATCH_SIZE: usize = 128;
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -33,7 +35,6 @@ pub struct Notifications {
     pub timeout_seconds: u64,
     pub max_attempts: u32,
     pub retry_backoff_milliseconds: u64,
-    pub allow_insecure_http: bool,
     pub fail_on_error: bool,
     pub webhooks: Vec<WebhookConfig>,
 }
@@ -47,7 +48,6 @@ impl Default for Notifications {
             timeout_seconds: 10,
             max_attempts: 3,
             retry_backoff_milliseconds: 500,
-            allow_insecure_http: false,
             fail_on_error: false,
             webhooks: Vec::new(),
         }
@@ -148,7 +148,6 @@ pub struct Settings {
     pub lock_file: PathBuf,
     pub zfs_command: PathBuf,
     pub zpool_command: PathBuf,
-    pub prune_sanoid_snapshots: bool,
 }
 
 impl Default for Settings {
@@ -161,7 +160,6 @@ impl Default for Settings {
             lock_file: PathBuf::from(DEFAULT_LOCK_FILE),
             zfs_command: PathBuf::from("zfs"),
             zpool_command: PathBuf::from("zpool"),
-            prune_sanoid_snapshots: false,
         }
     }
 }
@@ -462,14 +460,11 @@ impl Config {
             !self.datasets.is_empty(),
             "configuration must contain at least one dataset"
         );
-        ensure!(
-            self.settings.snapshot_batch_size > 0,
-            "snapshot_batch_size must be greater than zero"
-        );
-        ensure!(
-            self.settings.prune_batch_size > 0,
-            "prune_batch_size must be greater than zero"
-        );
+        validate_batch_sizes(
+            self.settings.snapshot_batch_size,
+            self.settings.prune_batch_size,
+            "settings",
+        )?;
         validate_prefix(&self.settings.snapshot_prefix)?;
         self.notifications.validate()?;
 
@@ -532,6 +527,18 @@ impl Config {
     }
 }
 
+fn validate_batch_sizes(snapshot: usize, prune: usize, context: &str) -> Result<()> {
+    ensure!(
+        (1..=MAX_SNAPSHOT_BATCH_SIZE).contains(&snapshot),
+        "{context}: snapshot_batch_size must be between 1 and {MAX_SNAPSHOT_BATCH_SIZE}"
+    );
+    ensure!(
+        (1..=MAX_PRUNE_BATCH_SIZE).contains(&prune),
+        "{context}: prune_batch_size must be between 1 and {MAX_PRUNE_BATCH_SIZE}"
+    );
+    Ok(())
+}
+
 impl Notifications {
     pub fn validate(&self) -> Result<()> {
         ensure!(
@@ -591,7 +598,7 @@ impl Notifications {
                 "{context}: events cannot contain duplicates"
             );
             if let Some(url) = &webhook.url {
-                validate_webhook_url(url.expose(), self.allow_insecure_http, &context)?;
+                validate_webhook_url(url.expose(), &context)?;
             }
             if let Some(variable) = &webhook.url_env {
                 ensure!(
@@ -604,11 +611,7 @@ impl Notifications {
     }
 }
 
-pub(crate) fn validate_webhook_url(
-    url: &str,
-    allow_insecure_http: bool,
-    context: &str,
-) -> Result<()> {
+pub(crate) fn validate_webhook_url(url: &str, context: &str) -> Result<()> {
     let uri = url
         .parse::<ureq::http::Uri>()
         .map_err(|_| anyhow::anyhow!("{context}: invalid webhook URL"))?;
@@ -619,10 +622,7 @@ pub(crate) fn validate_webhook_url(
         uri.authority().is_some(),
         "{context}: webhook URL must include a host"
     );
-    ensure!(
-        scheme == "https" || (allow_insecure_http && scheme == "http"),
-        "{context}: webhook URL must use HTTPS (set notifications.allow_insecure_http = true only for a trusted HTTP endpoint)"
-    );
+    ensure!(scheme == "https", "{context}: webhook URL must use HTTPS");
     Ok(())
 }
 
@@ -743,6 +743,51 @@ recursive = "zfs"
     }
 
     #[test]
+    fn validates_global_batch_size_bounds() {
+        let valid = config_with_notifications(
+            r#"
+[settings]
+snapshot_batch_size = 256
+prune_batch_size = 128
+"#,
+        );
+        toml::from_str::<Config>(&valid)
+            .unwrap()
+            .validate()
+            .unwrap();
+
+        let zero = config_with_notifications(
+            r#"
+[settings]
+snapshot_batch_size = 0
+"#,
+        );
+        assert!(
+            toml::from_str::<Config>(&zero)
+                .unwrap()
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("snapshot_batch_size must be between 1 and 256")
+        );
+
+        let too_large = config_with_notifications(
+            r#"
+[settings]
+prune_batch_size = 129
+"#,
+        );
+        assert!(
+            toml::from_str::<Config>(&too_large)
+                .unwrap()
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("prune_batch_size must be between 1 and 128")
+        );
+    }
+
+    #[test]
     fn parses_typed_webhook_configuration_with_failure_default() {
         let raw = config_with_notifications(
             r#"
@@ -782,6 +827,25 @@ url = "https://example.invalid/hook"
 "#,
         );
         assert!(toml::from_str::<Config>(&unknown_kind).is_err());
+    }
+
+    #[test]
+    fn rejects_removed_unsafe_switches() {
+        let unmanaged_pruning = config_with_notifications(
+            r#"
+[settings]
+prune_sanoid_snapshots = true
+"#,
+        );
+        assert!(toml::from_str::<Config>(&unmanaged_pruning).is_err());
+
+        let insecure_http = config_with_notifications(
+            r#"
+[notifications]
+allow_insecure_http = true
+"#,
+        );
+        assert!(toml::from_str::<Config>(&insecure_http).is_err());
     }
 
     #[test]

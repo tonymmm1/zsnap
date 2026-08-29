@@ -22,6 +22,23 @@ pub enum DeliveryEvent {
     Test,
 }
 
+#[derive(Clone, Copy)]
+enum TransportPolicy {
+    HttpsOnly,
+    #[cfg(test)]
+    TestHttp,
+}
+
+impl TransportPolicy {
+    const fn https_only(self) -> bool {
+        match self {
+            Self::HttpsOnly => true,
+            #[cfg(test)]
+            Self::TestHttp => false,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct NotificationReport {
     pub attempted: usize,
@@ -58,6 +75,15 @@ pub fn deliver(
     event: DeliveryEvent,
     message: &str,
 ) -> Result<NotificationReport> {
+    deliver_with_policy(config, event, message, TransportPolicy::HttpsOnly)
+}
+
+fn deliver_with_policy(
+    config: &Notifications,
+    event: DeliveryEvent,
+    message: &str,
+    transport_policy: TransportPolicy,
+) -> Result<NotificationReport> {
     let selected: Vec<_> = if config.enabled {
         config
             .webhooks
@@ -83,7 +109,7 @@ pub fn deliver(
         .context("failed to create the webhook delivery thread set")?;
     let agent: ureq::Agent = ureq::Agent::config_builder()
         .timeout_global(Some(Duration::from_secs(config.timeout_seconds)))
-        .https_only(!config.allow_insecure_http)
+        .https_only(transport_policy.https_only())
         .max_redirects(3)
         .user_agent(format!("zsnap/{}", env!("CARGO_PKG_VERSION")))
         .build()
@@ -93,7 +119,7 @@ pub fn deliver(
     let mut deliveries = pool.install(|| {
         selected
             .into_par_iter()
-            .map(|webhook| deliver_one(&agent, config, webhook, &message))
+            .map(|webhook| deliver_one(&agent, config, webhook, &message, transport_policy))
             .collect::<Vec<_>>()
     });
     deliveries.sort_by(|left, right| left.target.cmp(&right.target));
@@ -139,6 +165,7 @@ fn deliver_one(
     config: &Notifications,
     webhook: &WebhookConfig,
     message: &str,
+    transport_policy: TransportPolicy,
 ) -> NotificationDelivery {
     let mut delivery = NotificationDelivery {
         target: webhook.name.clone(),
@@ -146,7 +173,7 @@ fn deliver_one(
         attempts: 0,
         error: None,
     };
-    let url = match resolve_url(config, webhook) {
+    let url = match resolve_url(webhook, transport_policy) {
         Ok(url) => url,
         Err(error) => {
             delivery.error = Some(error);
@@ -194,8 +221,8 @@ fn payload(kind: WebhookKind, message: &str) -> String {
 }
 
 fn resolve_url(
-    config: &Notifications,
     webhook: &WebhookConfig,
+    transport_policy: TransportPolicy,
 ) -> std::result::Result<String, String> {
     let url = if let Some(url) = &webhook.url {
         url.expose().to_owned()
@@ -204,12 +231,14 @@ fn resolve_url(
     } else {
         return Err("no URL source is configured".to_owned());
     };
-    validate_webhook_url(
-        &url,
-        config.allow_insecure_http,
-        &format!("notification webhook {:?}", webhook.name),
-    )
-    .map_err(|error| error.to_string())?;
+    match transport_policy {
+        TransportPolicy::HttpsOnly => {
+            validate_webhook_url(&url, &format!("notification webhook {:?}", webhook.name))
+                .map_err(|error| error.to_string())?;
+        }
+        #[cfg(test)]
+        TransportPolicy::TestHttp => {}
+    }
     Ok(url)
 }
 
@@ -358,11 +387,16 @@ mod tests {
             max_parallel: 2,
             max_attempts: 1,
             retry_backoff_milliseconds: 0,
-            allow_insecure_http: true,
             webhooks,
             ..Notifications::default()
         };
-        let report = deliver(&config, DeliveryEvent::Failure, "test").unwrap();
+        let report = deliver_with_policy(
+            &config,
+            DeliveryEvent::Failure,
+            "test",
+            TransportPolicy::TestHttp,
+        )
+        .unwrap();
         server.join().unwrap();
         assert_eq!(report.delivered, 4);
         assert_eq!(maximum.load(Ordering::SeqCst), 2);

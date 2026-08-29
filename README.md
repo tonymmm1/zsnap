@@ -58,12 +58,20 @@ settings control separate workloads and do not multiply ZFS writes:
 | Setting | Default | What to do |
 | --- | ---: | --- |
 | `settings.max_parallel_pools` | `0` | `0` runs every independent pool concurrently. Keep it for roughly 1-4 pools; use `2` or `4` on hosts with many pools or shared controllers. |
-| `settings.snapshot_batch_size` | `128` | Maximum snapshot targets in one ZFS command. Leave it unless the OS reports an argument-size error. |
-| `settings.prune_batch_size` | `64` | Maximum snapshot names destroyed per dataset command. Leave it unless a ZFS version objects to long comma lists. |
+| `settings.snapshot_batch_size` | `128` | Maximum snapshot targets in one ZFS command; valid range `1..=256`. It does not add threads. |
+| `settings.prune_batch_size` | `64` | Maximum snapshot names destroyed per dataset command; valid range `1..=128`. It does not add threads. |
 | `notifications.max_parallel` | `4` | Maximum simultaneous HTTP requests, unrelated to pool concurrency. It matters only when more than four webhooks are configured. |
 | `notifications.timeout_seconds` | `10` | Whole-request deadline for each attempt. Increase only for a known slow internal relay. |
 | `notifications.max_attempts` | `3` | Total attempts for transient failures. Keep it low because the systemd job waits for delivery to finish. |
 | `notifications.retry_backoff_milliseconds` | `500` | Initial retry delay; later delays grow exponentially. |
+
+The batch settings trade subprocess count against command size, not disk
+parallelism. Keep the defaults initially; lowering them is useful for controlled
+experiments, while the validated maxima keep command arguments conservative.
+Batch size 1 can be useful for benchmarking or isolating failures, but it means
+more sequential ZFS processes—not less parallel disk activity. HDD, SSD, and NVMe
+presets are therefore not inferred; topology, vdev count, and shared controllers
+matter more than the media label.
 
 `prune_defer` is not a concurrency control. `0` applies retention on every run;
 for example, `prune_defer = 80` postpones deletion while the pool is below 80%
@@ -92,7 +100,7 @@ still has to be orchestrated outside ZFS, which the Rust executor already does.
 New snapshots receive the ZFS user property `org.zsnap:managed=yes`. By default,
 `zsnap` only deletes snapshots carrying that property. Existing Sanoid-compatible
 snapshots still count as recent snapshots when scheduling, preventing duplicates,
-but they are not deleted unless `prune_sanoid_snapshots = true` is explicitly set.
+but they are never deleted by `zsnap` because they lack its ownership marker.
 
 Additional guardrails:
 
@@ -252,7 +260,6 @@ version = 1
 [settings]
 snapshot_prefix = "autosnap"
 max_parallel_pools = 0
-prune_sanoid_snapshots = false
 
 [templates.production]
 autosnap = true
@@ -324,9 +331,8 @@ ZSNAP_FLOCK_WEBHOOK='https://api.flock.com/hooks/sendMessage/REPLACE'
 ```
 
 The systemd unit reads it as an optional `EnvironmentFile`; the OpenRC and Alpine
-periodic runners source it as a root-owned shell environment file. HTTPS is mandatory
-unless `allow_insecure_http = true` is explicitly set for a trusted local receiver.
-Errors and debug representations redact configured URLs.
+periodic runners source it as a root-owned shell environment file. Webhook URLs
+must use HTTPS. Errors and debug representations redact configured URLs.
 
 Test every enabled endpoint through the real delivery path without touching ZFS:
 
@@ -408,10 +414,11 @@ sudo zsnap notify-test
 ## Migrating from Sanoid
 
 Keep `snapshot_prefix = "autosnap"`. Existing Sanoid snapshots will suppress
-unnecessary duplicate snapshots. Initially leave `prune_sanoid_snapshots = false`,
-run `zsnap plan`, and confirm policy expansion and newly created snapshots. Enable
-that setting only when you intentionally want `zsnap` to prune compatible legacy
-snapshots that lack its ownership property.
+unnecessary duplicate snapshots, but `zsnap` will never prune them because they
+lack `org.zsnap:managed=yes`. Disable Sanoid before enabling `zsnap`, run
+`zsnap plan`, and confirm policy expansion and newly created snapshots. Remove old
+Sanoid snapshots manually under your existing migration policy when they are no
+longer needed.
 
 Sanoid configuration files are INI-style despite their TOML-like appearance; they
 are not accepted directly. Translate sections to `[templates.<name>]` and quoted

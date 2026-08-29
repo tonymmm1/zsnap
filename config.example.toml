@@ -11,10 +11,8 @@ snapshot_prefix = "autosnap"
 # Work inside each pool remains serialized to avoid competing writes to one pool.
 max_parallel_pools = 0
 
-# These are ZFS command argument counts, not thread counts. The defaults reduce
-# process-launch overhead while keeping command lines reasonably sized. They do
-# not normally need tuning; lower them only if the host reports an argument-size
-# limit or a particular ZFS version struggles with large multi-target commands.
+# Maximum targets grouped into one ZFS command; these do not create threads.
+# Defaults are conservative. Valid ranges are 1-256 and 1-128 respectively.
 snapshot_batch_size = 128
 prune_batch_size = 64
 
@@ -22,9 +20,9 @@ lock_file = "/run/zsnap/zsnap.lock"
 zfs_command = "zfs"
 zpool_command = "zpool"
 
-# Existing Sanoid-compatible snapshots count when deciding whether a snapshot
-# is due, but are not deleted unless this migration switch is explicitly enabled.
-prune_sanoid_snapshots = false
+# Pruning is ownership-safe and is not configurable: only snapshots carrying
+# org.zsnap:managed=yes are eligible. Compatible unmarked names may prevent a
+# duplicate snapshot, but they are never deleted.
 
 [notifications]
 # Webhooks are delivered after the ZFS lock is released. Each endpoint has its
@@ -39,9 +37,6 @@ max_parallel = 4
 timeout_seconds = 10
 max_attempts = 3
 retry_backoff_milliseconds = 500
-
-# HTTPS is required by default. Leave this false for Internet webhooks.
-allow_insecure_http = false
 
 # Normally a webhook outage is logged but does not make a successful snapshot
 # run fail. Enable this only if monitoring delivery is part of job success.

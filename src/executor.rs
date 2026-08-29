@@ -123,7 +123,6 @@ fn execute_pool(work: PoolWork, settings: &Settings, dry_run: bool, verbose: boo
             .logs
             .push(format!("[{}] starting pool work", work.pool));
     }
-
     let mut snapshot_failed = false;
     let mut batchable_regular = Vec::new();
     let mut batchable_recursive = Vec::new();
@@ -565,6 +564,63 @@ mod tests {
         assert_eq!(calls.lines().count(), 1);
         assert!(calls.contains("tank/a@autosnap_a_hourly"));
         assert!(calls.contains("tank/b@autosnap_b_hourly"));
+    }
+
+    #[test]
+    fn configured_batch_limits_split_and_execute_long_argument_sets() {
+        let directory = tempdir().unwrap();
+        let script = directory.path().join("fake-zfs");
+        let log = directory.path().join("calls.log");
+        fs::write(
+            &script,
+            format!("#!/bin/sh\nprintf '%s\\n' \"$1\" >> '{}'\n", log.display()),
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&script).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&script, permissions).unwrap();
+
+        let long_suffix = "x".repeat(200);
+        let snapshot_names = (0..3)
+            .map(|index| format!("autosnap_{index:03}_{long_suffix}_hourly"))
+            .collect::<Vec<_>>();
+        let prune_names = (0..3)
+            .map(|index| format!("autosnap_{index:03}_{long_suffix}_daily"))
+            .collect::<Vec<_>>();
+        let policy = Policy::default();
+        let plan = Plan {
+            snapshots: vec![SnapshotAction {
+                pool: "tank".to_owned(),
+                dataset: "tank/data".to_owned(),
+                recursive: false,
+                names: snapshot_names,
+                kinds: vec![],
+                policy: policy.clone(),
+            }],
+            prunes: vec![PruneAction {
+                pool: "tank".to_owned(),
+                dataset: "tank/data".to_owned(),
+                names: prune_names,
+                policy,
+            }],
+            ..Plan::default()
+        };
+        let settings = Settings {
+            zfs_command: script,
+            snapshot_batch_size: 2,
+            prune_batch_size: 2,
+            ..Settings::default()
+        };
+
+        let report = execute(&plan, &settings, false, false).unwrap();
+        assert!(report.succeeded(), "{:?}", report.errors);
+        assert_eq!(report.snapshots_created, 3);
+        assert_eq!(report.snapshots_pruned, 3);
+        let calls = fs::read_to_string(log).unwrap();
+        assert_eq!(
+            calls.lines().collect::<Vec<_>>(),
+            ["snapshot", "snapshot", "destroy", "destroy"]
+        );
     }
 
     #[test]

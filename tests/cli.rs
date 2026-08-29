@@ -1,10 +1,6 @@
 use std::fs;
-use std::io::{Read, Write};
-use std::net::TcpListener;
 use std::os::unix::fs::PermissionsExt;
 use std::process::Command;
-use std::thread;
-use std::time::Duration;
 
 use serde_json::Value;
 use tempfile::tempdir;
@@ -17,9 +13,6 @@ fn plans_and_executes_against_fake_zfs_tools() {
     let calls = directory.path().join("calls.log");
     let lock = directory.path().join("zsnap.lock");
     let config = directory.path().join("zsnap.toml");
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let webhook_address = listener.local_addr().unwrap();
-    let webhook_server = thread::spawn(move || receive_webhook(listener));
 
     write_executable(
         &zfs,
@@ -61,16 +54,6 @@ zfs_command = "{}"
 zpool_command = "{}"
 lock_file = "{}"
 max_parallel_pools = 0
-
-[notifications]
-allow_insecure_http = true
-max_attempts = 1
-
-[[notifications.webhooks]]
-name = "success-receiver"
-kind = "slack"
-url = "http://{webhook_address}/hook"
-events = ["success"]
 
 [templates.test]
 autosnap = true
@@ -140,8 +123,6 @@ use_templates = ["test"]
     let report: Value = serde_json::from_slice(&run.stdout).unwrap();
     assert_eq!(report["snapshots_created"], 2);
     assert_eq!(calls_for(&calls, "snapshot"), 2); // One batched call per independent pool.
-    let webhook_request = webhook_server.join().unwrap();
-    assert!(webhook_request.contains("zsnap run SUCCESS"));
 }
 
 #[test]
@@ -163,29 +144,14 @@ fn distributed_example_configuration_is_valid() {
 }
 
 #[test]
-fn notify_test_posts_a_provider_specific_payload() {
+fn notify_test_requires_an_enabled_target() {
     let directory = tempdir().unwrap();
     let config = directory.path().join("zsnap.toml");
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let address = listener.local_addr().unwrap();
-    let server = thread::spawn(move || receive_webhook(listener));
     fs::write(
         &config,
-        format!(
-            r#"version = 1
-
-[notifications]
-allow_insecure_http = true
-max_attempts = 1
-
-[[notifications.webhooks]]
-name = "local-discord"
-kind = "discord"
-url = "http://{address}/webhook"
-
+        r#"version = 1
 [datasets."tank/data"]
-"#
-        ),
+"#,
     )
     .unwrap();
 
@@ -200,36 +166,19 @@ url = "http://{address}/webhook"
         ])
         .output()
         .unwrap();
+    assert!(!output.status.success());
     assert!(
-        output.status.success(),
-        "{}",
         String::from_utf8_lossy(&output.stderr)
+            .contains("no enabled notification webhooks are configured")
     );
-    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(report["attempted"], 1);
-    assert_eq!(report["delivered"], 1);
-
-    let request = server.join().unwrap();
-    let (_, body) = request.split_once("\r\n\r\n").unwrap();
-    let payload: Value = serde_json::from_str(body).unwrap();
-    assert!(
-        payload["content"]
-            .as_str()
-            .unwrap()
-            .contains("integration check")
-    );
-    assert_eq!(payload["allowed_mentions"]["parse"], serde_json::json!([]));
 }
 
 #[test]
-fn failed_zfs_run_sends_a_failure_notification_and_stays_failed() {
+fn failed_zfs_run_attempts_a_failure_notification_and_stays_failed() {
     let directory = tempdir().unwrap();
     let zfs = directory.path().join("zfs");
     let zpool = directory.path().join("zpool");
     let config = directory.path().join("zsnap.toml");
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let address = listener.local_addr().unwrap();
-    let server = thread::spawn(move || receive_webhook(listener));
 
     write_executable(
         &zfs,
@@ -260,13 +209,13 @@ zpool_command = "{}"
 lock_file = "{}"
 
 [notifications]
-allow_insecure_http = true
 max_attempts = 1
+timeout_seconds = 1
 
 [[notifications.webhooks]]
 name = "failure-receiver"
 kind = "flock"
-url = "http://{address}/hook"
+url = "https://127.0.0.1:1/hook"
 
 [templates.test]
 frequently = 0
@@ -296,8 +245,10 @@ use_templates = ["test"]
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    let request = server.join().unwrap();
-    assert!(request.contains("zsnap run FAILURE"));
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("NOTIFICATION ERROR [flock:failure-receiver")
+    );
 }
 
 fn write_executable(path: &std::path::Path, contents: &str) {
@@ -313,38 +264,4 @@ fn calls_for(path: &std::path::Path, command: &str) -> usize {
         .lines()
         .filter(|line| line.starts_with(command))
         .count()
-}
-
-fn receive_webhook(listener: TcpListener) -> String {
-    let (mut stream, _) = listener.accept().unwrap();
-    stream
-        .set_read_timeout(Some(Duration::from_secs(5)))
-        .unwrap();
-    let mut request = Vec::new();
-    let mut buffer = [0_u8; 2_048];
-    loop {
-        let read = stream.read(&mut buffer).unwrap();
-        if read == 0 {
-            break;
-        }
-        request.extend_from_slice(&buffer[..read]);
-        if let Some(header_end) = request.windows(4).position(|window| window == b"\r\n\r\n") {
-            let headers = String::from_utf8_lossy(&request[..header_end]);
-            let content_length = headers
-                .lines()
-                .find_map(|line| {
-                    line.strip_prefix("content-length: ")
-                        .or_else(|| line.strip_prefix("Content-Length: "))
-                })
-                .and_then(|value| value.parse::<usize>().ok())
-                .unwrap_or(0);
-            if request.len() >= header_end + 4 + content_length {
-                break;
-            }
-        }
-    }
-    stream
-        .write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
-        .unwrap();
-    String::from_utf8(request).unwrap()
 }
