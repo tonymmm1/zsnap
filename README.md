@@ -50,6 +50,27 @@ Webhook delivery has its own bounded worker set and starts only after the ZFS ru
 lock has been released. HTTPS uses rustls with bundled Mozilla roots, so webhooks
 do not introduce an OpenSSL runtime dependency.
 
+### Practical tuning
+
+The shipped values are intended to be useful without tuning. The two parallelism
+settings control separate workloads and do not multiply ZFS writes:
+
+| Setting | Default | What to do |
+| --- | ---: | --- |
+| `settings.max_parallel_pools` | `0` | `0` runs every independent pool concurrently. Keep it for roughly 1-4 pools; use `2` or `4` on hosts with many pools or shared controllers. |
+| `settings.snapshot_batch_size` | `128` | Maximum snapshot targets in one ZFS command. Leave it unless the OS reports an argument-size error. |
+| `settings.prune_batch_size` | `64` | Maximum snapshot names destroyed per dataset command. Leave it unless a ZFS version objects to long comma lists. |
+| `notifications.max_parallel` | `4` | Maximum simultaneous HTTP requests, unrelated to pool concurrency. It matters only when more than four webhooks are configured. |
+| `notifications.timeout_seconds` | `10` | Whole-request deadline for each attempt. Increase only for a known slow internal relay. |
+| `notifications.max_attempts` | `3` | Total attempts for transient failures. Keep it low because the systemd job waits for delivery to finish. |
+| `notifications.retry_backoff_milliseconds` | `500` | Initial retry delay; later delays grow exponentially. |
+
+`prune_defer` is not a concurrency control. `0` applies retention on every run;
+for example, `prune_defer = 80` postpones deletion while the pool is below 80%
+capacity and resumes retention pruning once it reaches that threshold. The process
+lock still permits only one mutating `zsnap` invocation at a time, even when a
+timer overlaps a manual run.
+
 ### Why channel programs are not the default
 
 OpenZFS channel programs are appealing for very large prune sets: one pool-scoped

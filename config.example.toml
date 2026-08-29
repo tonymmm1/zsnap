@@ -5,9 +5,16 @@ version = 1
 # Sanoid-compatible names: autosnap_YYYY-MM-DD_HH:MM:SS_<period>
 snapshot_prefix = "autosnap"
 
-# 0 means one worker for every pool represented by the plan. Work inside each
-# pool is serialized and batched to avoid turning command concurrency into I/O contention.
+# Recommended for a normal host with a handful of pools: leave this at 0, which
+# means one worker for every pool represented by the plan. On a host with many
+# pools or shared storage hardware, set 2-4 to place a global cap on pool workers.
+# Work inside each pool remains serialized to avoid competing writes to one pool.
 max_parallel_pools = 0
+
+# These are ZFS command argument counts, not thread counts. The defaults reduce
+# process-launch overhead while keeping command lines reasonably sized. They do
+# not normally need tuning; lower them only if the host reports an argument-size
+# limit or a particular ZFS version struggles with large multi-target commands.
 snapshot_batch_size = 128
 prune_batch_size = 64
 
@@ -22,8 +29,13 @@ prune_sanoid_snapshots = false
 [notifications]
 # Webhooks are delivered after the ZFS lock is released. Each endpoint has its
 # own retry loop, and different endpoints are sent concurrently up to this cap.
+# Four is intentionally modest; lowering it only makes sense for a rate-limited
+# local relay, while raising it helps only when more than four hooks are configured.
 enabled = true
 max_parallel = 4
+
+# These values apply to each endpoint. At the defaults, one unreachable endpoint
+# can take roughly 32 seconds across three 10-second attempts and two backoffs.
 timeout_seconds = 10
 max_attempts = 3
 retry_backoff_milliseconds = 500
