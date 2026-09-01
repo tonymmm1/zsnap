@@ -44,7 +44,8 @@ in memory. For execution it:
 
 1. assigns one independent worker to each zpool;
 2. combines unhooked snapshots from the same pool into bounded, atomic multi-dataset
-   `zfs snapshot` calls;
+   `zfs snapshot` calls, with separate rounds when one dataset has several due
+   schedule classes;
 3. combines snapshot deletions for each dataset with ZFS's comma-list syntax; and
 4. serializes commands within a pool by default, avoiding extra queueing and disk
    contention on the same vdevs.
@@ -65,7 +66,7 @@ settings control separate workloads and do not multiply ZFS writes:
 | Setting | Default | What to do |
 | --- | ---: | --- |
 | `settings.max_parallel_pools` | `0` | `0` runs every independent pool concurrently. Keep it for roughly 1-4 pools; use `2` or `4` on hosts with many pools or shared controllers. |
-| `settings.snapshot_batch_size` | `128` | Maximum snapshot targets in one ZFS command; valid range `1..=256`. It does not add threads. |
+| `settings.snapshot_batch_size` | `128` | Maximum distinct dataset targets in one ZFS command; valid range `1..=256`. OpenZFS requires separate commands for multiple due names on one dataset. It does not add threads. |
 | `settings.prune_batch_size` | `64` | Maximum snapshot names destroyed per dataset command; valid range `1..=128`. It does not add threads. |
 | `notifications.max_parallel` | `4` | Maximum simultaneous HTTP requests, unrelated to pool concurrency. It matters only when more than four webhooks are configured. |
 | `notifications.timeout_seconds` | `10` | Whole-request deadline for each attempt. Increase only for a known slow internal relay. |
@@ -108,6 +109,14 @@ New snapshots receive the ZFS user property `org.zsnap:managed=yes`. By default,
 `zsnap` only deletes snapshots carrying that property. Existing Sanoid-compatible
 snapshots still count as recent snapshots when scheduling, preventing duplicates,
 but they are never deleted by `zsnap` because they lack its ownership marker.
+
+Every generated `zfs destroy` command is checked again at the execution boundary.
+Only strict `dataset@snapshot[,snapshot...]` targets without flags are permitted;
+dataset/volume destruction, recursive destruction, bookmarks, and snapshot ranges
+are rejected before the configured ZFS executable is started. zsnap never invokes
+`zpool checkpoint -d`, so it cannot discard pool checkpoints.
+This guarantee covers zsnap's built-in operations; administrator-configured hooks
+are arbitrary programs and must be trusted like any other root-run hook.
 
 Additional guardrails:
 

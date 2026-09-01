@@ -173,28 +173,39 @@ fn execute_snapshot_batches(
     dry_run: bool,
     result: &mut PoolResult,
 ) -> bool {
-    let targets: Vec<_> = actions
-        .iter()
-        .flat_map(|action| {
-            action
-                .names
-                .iter()
-                .map(|name| format!("{}@{name}", action.dataset))
-        })
-        .collect();
     let mut succeeded = true;
-    for chunk in targets.chunks(settings.snapshot_batch_size) {
-        let mut args: Vec<OsString> = vec![OsString::from("snapshot")];
-        if recursive {
-            args.push(OsString::from("-r"));
-        }
-        args.push(OsString::from("-o"));
-        args.push(OsString::from(format!("{MANAGED_PROPERTY}=yes")));
-        args.extend(chunk.iter().map(OsString::from));
-        if invoke_zfs(settings, &args, dry_run, result) {
-            result.snapshots_created += chunk.len();
-        } else {
-            succeeded = false;
+    let round_count = actions
+        .iter()
+        .map(|action| action.names.len())
+        .max()
+        .unwrap_or(0);
+
+    // OpenZFS accepts snapshots for multiple filesystems in one invocation, but
+    // rejects multiple snapshot names for the same filesystem. Build one target
+    // per dataset in each round, then apply the configured command-size limit.
+    for name_index in 0..round_count {
+        let targets = actions
+            .iter()
+            .filter_map(|action| {
+                action
+                    .names
+                    .get(name_index)
+                    .map(|name| format!("{}@{name}", action.dataset))
+            })
+            .collect::<Vec<_>>();
+        for chunk in targets.chunks(settings.snapshot_batch_size) {
+            let mut args: Vec<OsString> = vec![OsString::from("snapshot")];
+            if recursive {
+                args.push(OsString::from("-r"));
+            }
+            args.push(OsString::from("-o"));
+            args.push(OsString::from(format!("{MANAGED_PROPERTY}=yes")));
+            args.extend(chunk.iter().map(OsString::from));
+            if invoke_zfs(settings, &args, dry_run, result) {
+                result.snapshots_created += chunk.len();
+            } else {
+                succeeded = false;
+            }
         }
     }
     succeeded
@@ -206,10 +217,6 @@ fn execute_hooked_snapshot(
     dry_run: bool,
     result: &mut PoolResult,
 ) -> bool {
-    let targets = action
-        .names
-        .iter()
-        .map(|name| format!("{}@{name}", action.dataset));
     let types = action
         .kinds
         .iter()
@@ -260,16 +267,20 @@ fn execute_hooked_snapshot(
         return false;
     }
 
-    let mut args: Vec<OsString> = vec![OsString::from("snapshot")];
-    if action.recursive {
-        args.push(OsString::from("-r"));
-    }
-    args.push(OsString::from("-o"));
-    args.push(OsString::from(format!("{MANAGED_PROPERTY}=yes")));
-    args.extend(targets.map(OsString::from));
-    let snapshot_succeeded = invoke_zfs(settings, &args, dry_run, result);
-    if snapshot_succeeded {
-        result.snapshots_created += action.names.len();
+    let mut snapshot_succeeded = true;
+    for name in &action.names {
+        let mut args: Vec<OsString> = vec![OsString::from("snapshot")];
+        if action.recursive {
+            args.push(OsString::from("-r"));
+        }
+        args.push(OsString::from("-o"));
+        args.push(OsString::from(format!("{MANAGED_PROPERTY}=yes")));
+        args.push(OsString::from(format!("{}@{name}", action.dataset)));
+        if invoke_zfs(settings, &args, dry_run, result) {
+            result.snapshots_created += 1;
+        } else {
+            snapshot_succeeded = false;
+        }
     }
 
     let mut post_succeeded = true;
@@ -363,6 +374,15 @@ fn invoke_zfs(
     result: &mut PoolResult,
 ) -> bool {
     let command = render_command(settings.zfs_command.as_os_str(), args);
+    if args.first().is_some_and(|argument| argument == "destroy") {
+        if let Err(reason) = validate_snapshot_destroy_command(args) {
+            result.errors.push(format!(
+                "[{}] refused unsafe ZFS destroy command {command}: {reason}",
+                result.pool
+            ));
+            return false;
+        }
+    }
     if dry_run {
         result
             .logs
@@ -389,6 +409,37 @@ fn invoke_zfs(
             false
         }
     }
+}
+
+fn validate_snapshot_destroy_command(args: &[OsString]) -> std::result::Result<(), &'static str> {
+    if args.first().map(OsString::as_os_str) != Some(OsStr::new("destroy")) {
+        return Err("command is not a snapshot deletion");
+    }
+    if args.len() != 2 {
+        return Err("snapshot deletion requires exactly one target and no flags");
+    }
+    let Some(target) = args[1].to_str() else {
+        return Err("snapshot deletion target is not valid UTF-8");
+    };
+    let Some((dataset, names)) = target.split_once('@') else {
+        return Err("target is not a dataset@snapshot expression");
+    };
+    if dataset.is_empty()
+        || dataset.starts_with('-')
+        || dataset.chars().any(char::is_whitespace)
+        || dataset.contains(['@', '#', ','])
+    {
+        return Err("dataset portion is invalid");
+    }
+    if names.split(',').any(|name| {
+        name.is_empty()
+            || name.starts_with('-')
+            || name.chars().any(char::is_whitespace)
+            || name.contains(['@', '#', '%', '/'])
+    }) {
+        return Err("snapshot name list is invalid");
+    }
+    Ok(())
 }
 
 #[derive(Clone, Copy)]
@@ -567,6 +618,181 @@ mod tests {
     }
 
     #[test]
+    fn separates_multiple_snapshot_names_for_each_dataset_into_rounds() {
+        let directory = tempdir().unwrap();
+        let script = directory.path().join("fake-zfs");
+        let log = directory.path().join("calls.log");
+        fs::write(
+            &script,
+            format!("#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\n", log.display()),
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&script).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&script, permissions).unwrap();
+
+        let settings = Settings {
+            zfs_command: script,
+            ..Settings::default()
+        };
+        let policy = Policy::default();
+        let plan = Plan {
+            snapshots: vec![
+                SnapshotAction {
+                    pool: "tank".to_owned(),
+                    dataset: "tank/a".to_owned(),
+                    recursive: false,
+                    names: vec![
+                        "autosnap_a_daily".to_owned(),
+                        "autosnap_a_weekly".to_owned(),
+                        "autosnap_a_monthly".to_owned(),
+                    ],
+                    kinds: vec![],
+                    policy: policy.clone(),
+                },
+                SnapshotAction {
+                    pool: "tank".to_owned(),
+                    dataset: "tank/b".to_owned(),
+                    recursive: false,
+                    names: vec![
+                        "autosnap_b_daily".to_owned(),
+                        "autosnap_b_weekly".to_owned(),
+                    ],
+                    kinds: vec![],
+                    policy,
+                },
+            ],
+            ..Plan::default()
+        };
+
+        let report = execute(&plan, &settings, false, false).unwrap();
+        assert!(report.succeeded(), "{:?}", report.errors);
+        assert_eq!(report.snapshots_created, 5);
+        let calls = fs::read_to_string(log).unwrap();
+        assert_eq!(
+            calls.lines().collect::<Vec<_>>(),
+            [
+                "snapshot -o org.zsnap:managed=yes tank/a@autosnap_a_daily tank/b@autosnap_b_daily",
+                "snapshot -o org.zsnap:managed=yes tank/a@autosnap_a_weekly tank/b@autosnap_b_weekly",
+                "snapshot -o org.zsnap:managed=yes tank/a@autosnap_a_monthly",
+            ]
+        );
+    }
+
+    #[test]
+    fn hooked_snapshot_names_use_separate_zfs_commands() {
+        let directory = tempdir().unwrap();
+        let script = directory.path().join("fake-zfs");
+        let log = directory.path().join("calls.log");
+        fs::write(
+            &script,
+            format!("#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\n", log.display()),
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&script).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&script, permissions).unwrap();
+
+        let settings = Settings {
+            zfs_command: script,
+            ..Settings::default()
+        };
+        let policy = Policy {
+            pre_snapshot_script: vec!["/bin/true".to_owned()],
+            ..Policy::default()
+        };
+        let plan = Plan {
+            snapshots: vec![SnapshotAction {
+                pool: "tank".to_owned(),
+                dataset: "tank/data".to_owned(),
+                recursive: false,
+                names: vec![
+                    "autosnap_data_daily".to_owned(),
+                    "autosnap_data_weekly".to_owned(),
+                ],
+                kinds: vec![],
+                policy,
+            }],
+            ..Plan::default()
+        };
+
+        let report = execute(&plan, &settings, false, false).unwrap();
+        assert!(report.succeeded(), "{:?}", report.errors);
+        assert_eq!(report.snapshots_created, 2);
+        let calls = fs::read_to_string(log).unwrap();
+        assert_eq!(
+            calls.lines().collect::<Vec<_>>(),
+            [
+                "snapshot -o org.zsnap:managed=yes tank/data@autosnap_data_daily",
+                "snapshot -o org.zsnap:managed=yes tank/data@autosnap_data_weekly",
+            ]
+        );
+    }
+
+    #[test]
+    fn destroy_safety_gate_accepts_only_snapshot_targets() {
+        let safe = [
+            OsString::from("destroy"),
+            OsString::from("tank/data@autosnap_daily,autosnap_weekly"),
+        ];
+        assert!(validate_snapshot_destroy_command(&safe).is_ok());
+
+        let unsafe_commands = [
+            vec![OsString::from("destroy"), OsString::from("tank/data")],
+            vec![
+                OsString::from("destroy"),
+                OsString::from("-r"),
+                OsString::from("tank/data@autosnap_daily"),
+            ],
+            vec![
+                OsString::from("destroy"),
+                OsString::from("tank/data#bookmark"),
+            ],
+            vec![
+                OsString::from("destroy"),
+                OsString::from("tank/data@old%new"),
+            ],
+            vec![OsString::from("destroy"), OsString::from("tank/data@")],
+            vec![
+                OsString::from("destroy"),
+                OsString::from("tank/data@autosnap/child"),
+            ],
+        ];
+        for command in unsafe_commands {
+            assert!(
+                validate_snapshot_destroy_command(&command).is_err(),
+                "accepted unsafe command: {command:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn unsafe_destroy_never_reaches_the_zfs_executable() {
+        let directory = tempdir().unwrap();
+        let script = directory.path().join("fake-zfs");
+        let marker = directory.path().join("executed");
+        fs::write(&script, format!("#!/bin/sh\n: > '{}'\n", marker.display())).unwrap();
+        let mut permissions = fs::metadata(&script).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&script, permissions).unwrap();
+
+        let settings = Settings {
+            zfs_command: script,
+            ..Settings::default()
+        };
+        let mut result = PoolResult {
+            pool: "tank".to_owned(),
+            ..PoolResult::default()
+        };
+        let args = [OsString::from("destroy"), OsString::from("tank/data")];
+
+        assert!(!invoke_zfs(&settings, &args, false, &mut result));
+        assert!(!marker.exists());
+        assert_eq!(result.errors.len(), 1);
+        assert!(result.errors[0].contains("refused unsafe ZFS destroy command"));
+    }
+
+    #[test]
     fn configured_batch_limits_split_and_execute_long_argument_sets() {
         let directory = tempdir().unwrap();
         let script = directory.path().join("fake-zfs");
@@ -619,7 +845,7 @@ mod tests {
         let calls = fs::read_to_string(log).unwrap();
         assert_eq!(
             calls.lines().collect::<Vec<_>>(),
-            ["snapshot", "snapshot", "destroy", "destroy"]
+            ["snapshot", "snapshot", "snapshot", "destroy", "destroy"]
         );
     }
 
