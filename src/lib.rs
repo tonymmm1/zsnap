@@ -1,6 +1,7 @@
 pub mod config;
 pub mod executor;
 pub mod lock;
+pub mod migration;
 pub mod model;
 pub mod notification;
 pub mod planner;

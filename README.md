@@ -31,6 +31,8 @@ proposed deletion, and test against a disposable ZFS pool.
 - Supports pre/post snapshot and pruning hooks with timeouts and Sanoid-compatible
   environment aliases.
 - Provides text or JSON plans, non-mutating dry runs, and a process-wide lock.
+- Converts Sanoid `sanoid.conf` policy into validated zsnap TOML without modifying
+  the source configuration or querying ZFS.
 
 ## Why it is efficient
 
@@ -447,7 +449,11 @@ Equivalent `SANOID_*` variables are also set to ease hook migration. Set a hook 
 ## Commands
 
 ```console
-# Syntax-only validation; does not require ZFS.
+# Convert Sanoid policy into a new validated mode-0600 file; never overwrites.
+zsnap migrate-sanoid --input /etc/sanoid/sanoid.conf \
+  --output ./zsnap.migrated.toml
+
+# Offline syntax and policy validation; does not require ZFS.
 zsnap --config ./config.example.toml check
 
 # Validate dataset names and recursive expansion against this host.
@@ -468,18 +474,49 @@ sudo zsnap prune
 sudo zsnap notify-test
 ```
 
+`check` is the configuration linter. It validates TOML syntax, rejects unknown
+keys, verifies value bounds, template references, recursion combinations, dataset
+names, hooks, and webhook settings. Every operational command loads the file
+through the same validator before it can query or mutate ZFS, so an invalid file
+cannot reach snapshot or prune execution. Add `--probe` only when the linter should
+also verify datasets and recursive expansion against the current host.
+
 ## Migrating from Sanoid
+
+Create a new zsnap configuration without changing the Sanoid source file:
+
+```console
+zsnap migrate-sanoid \
+  --input /etc/sanoid/sanoid.conf \
+  --output ./zsnap.migrated.toml
+zsnap --config ./zsnap.migrated.toml check
+sudo zsnap --config ./zsnap.migrated.toml check --probe
+sudo zsnap --config ./zsnap.migrated.toml plan
+```
+
+The converter automatically reads `sanoid.defaults.conf` beside the input when it
+exists; use `--defaults /path/to/sanoid.defaults.conf` to select another copy.
+Omitting `--output` prints the generated TOML for inspection. With `--output`, the
+file is created mode 0600 and an existing path is always rejected. The generated
+TOML is passed through the same parser and semantic validator used by normal zsnap
+runs before it is written. Migration never invokes `zfs` or `zpool`, modifies the
+source, disables Sanoid, or installs/enables a service.
+
+Retention, schedules, ordered templates, dataset overrides, `path`, recursion,
+`process_children_only`, prune deferral, and hooks are converted. Sanoid hooks are
+preserved through explicit `["/bin/sh", "-c", "command"]` argv and produce a review
+warning. The converter also warns that Sanoid interprets schedule fields in host
+local time while zsnap uses UTC; review those times before enabling the timer.
+Monitoring-only keys are reported and omitted because monitoring is outside
+zsnap's scope. A setting that cannot be represented without changing snapshot
+coverage, such as `skip_children = yes`, stops conversion rather than silently
+emitting a lossy policy.
 
 Keep `snapshot_prefix = "autosnap"`. Existing Sanoid snapshots will suppress
 unnecessary duplicate snapshots, but `zsnap` will never prune them because they
-lack `org.zsnap:managed=yes`. Disable Sanoid before enabling `zsnap`, run
-`zsnap plan`, and confirm policy expansion and newly created snapshots. Remove old
-Sanoid snapshots manually under your existing migration policy when they are no
-longer needed.
-
-Sanoid configuration files are INI-style despite their TOML-like appearance; they
-are not accepted directly. Translate sections to `[templates.<name>]` and quoted
-`[datasets."pool/path"]` TOML tables.
+lack `org.zsnap:managed=yes`. After reviewing the converted file and plan, disable
+Sanoid before enabling the zsnap timer. Remove old Sanoid snapshots manually under
+your existing migration policy when they are no longer needed.
 
 ## Project scope and provenance
 

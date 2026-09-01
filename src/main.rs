@@ -1,13 +1,17 @@
-use std::path::PathBuf;
+use std::fs::{self, OpenOptions};
+use std::io::Write;
+use std::os::unix::fs::OpenOptionsExt;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use chrono::Utc;
 use clap::{Parser, Subcommand, ValueEnum};
 use serde::Serialize;
 use zsnap::config::Config;
 use zsnap::executor::{ExecutionReport, execute};
 use zsnap::lock::RunLock;
+use zsnap::migration::convert_sanoid;
 use zsnap::notification::{self, DeliveryEvent, NotificationReport};
 use zsnap::planner::{Plan, build_plan, resolve_datasets};
 use zsnap::zfs::Inventory;
@@ -63,6 +67,20 @@ enum Commands {
         #[arg(long)]
         probe: bool,
     },
+    /// Convert a Sanoid sanoid.conf into validated zsnap TOML without touching ZFS.
+    MigrateSanoid {
+        /// Sanoid configuration to read; it is never modified.
+        #[arg(short, long, default_value = "/etc/sanoid/sanoid.conf")]
+        input: PathBuf,
+
+        /// Optional sanoid.defaults.conf; the sibling file is detected automatically.
+        #[arg(long)]
+        defaults: Option<PathBuf>,
+
+        /// Create this file with mode 0600; existing paths are never overwritten.
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+    },
     /// Send a test message to every enabled webhook.
     NotifyTest {
         /// Text appended to the test notification.
@@ -95,8 +113,16 @@ struct RunSummary {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    let config = Config::load(&cli.config)?;
+    if let Commands::MigrateSanoid {
+        input,
+        defaults,
+        output,
+    } = &cli.command
+    {
+        return migrate_sanoid(input, defaults.as_deref(), output.as_deref(), cli.json);
+    }
 
+    let config = Config::load(&cli.config)?;
     if let Commands::Check { probe } = &cli.command {
         return check(&config, *probe, cli.json);
     }
@@ -162,7 +188,9 @@ fn run_zfs_command(cli: &Cli, config: &Config) -> Result<RunSummary> {
         Commands::Snapshot { dry_run } => (PlanScope::Snapshot, *dry_run, true),
         Commands::Prune { dry_run } => (PlanScope::Prune, *dry_run, true),
         Commands::Plan { scope } => (*scope, true, false),
-        Commands::Check { .. } | Commands::NotifyTest { .. } => unreachable!(),
+        Commands::Check { .. } | Commands::MigrateSanoid { .. } | Commands::NotifyTest { .. } => {
+            unreachable!()
+        }
     };
 
     // Hold the lock across discovery, planning, and mutation so two invocations cannot race.
@@ -250,6 +278,88 @@ fn print_notification_errors(report: &NotificationReport) {
             );
         }
     }
+}
+
+fn migrate_sanoid(
+    input: &Path,
+    requested_defaults: Option<&Path>,
+    output: Option<&Path>,
+    json: bool,
+) -> Result<()> {
+    let source = fs::read_to_string(input)
+        .with_context(|| format!("failed to read Sanoid configuration {}", input.display()))?;
+    let sibling_defaults = input.with_file_name("sanoid.defaults.conf");
+    let defaults_path = requested_defaults
+        .map(Path::to_path_buf)
+        .or_else(|| sibling_defaults.is_file().then_some(sibling_defaults));
+    let defaults = defaults_path
+        .as_ref()
+        .map(|path| {
+            fs::read_to_string(path)
+                .with_context(|| format!("failed to read Sanoid defaults {}", path.display()))
+        })
+        .transpose()?;
+    let mut migration = convert_sanoid(&source, defaults.as_deref())?;
+    if defaults_path.is_none() {
+        migration.warnings.insert(
+            0,
+            "sanoid.defaults.conf was not supplied or found beside the input; used embedded Sanoid 2.x defaults"
+                .to_owned(),
+        );
+    }
+
+    if let Some(path) = output {
+        write_new_config(path, &migration.config_toml)?;
+    }
+    if json {
+        println!("{}", serde_json::to_string_pretty(&migration)?);
+        return Ok(());
+    }
+    for warning in &migration.warnings {
+        eprintln!("MIGRATION WARNING: {warning}");
+    }
+    if let Some(path) = output {
+        println!(
+            "wrote validated zsnap configuration to {} ({} dataset(s), {} template(s), {} warning(s)); source unchanged; no ZFS commands run",
+            path.display(),
+            migration.datasets,
+            migration.templates,
+            migration.warnings.len()
+        );
+    } else {
+        print!("{}", migration.config_toml);
+    }
+    Ok(())
+}
+
+fn write_new_config(path: &Path, contents: &str) -> Result<()> {
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true).mode(0o600);
+    let mut file = match options.open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            bail!(
+                "refusing to overwrite existing migration output {}; choose a new path",
+                path.display()
+            )
+        }
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("failed to create migration output {}", path.display()));
+        }
+    };
+    if let Err(error) = file
+        .write_all(contents.as_bytes())
+        .and_then(|()| file.sync_all())
+    {
+        return Err(error).with_context(|| {
+            format!(
+                "failed to write migration output {}; the partial create-new file was left in place for inspection",
+                path.display()
+            )
+        });
+    }
+    Ok(())
 }
 
 fn check(config: &Config, probe: bool, json: bool) -> Result<()> {

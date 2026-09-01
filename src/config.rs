@@ -4,7 +4,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail, ensure};
-use serde::{Deserialize, Deserializer};
+use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::model::SnapshotKind;
 
@@ -212,7 +212,7 @@ impl<'de> Deserialize<'de> for Recursion {
     }
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 pub struct PolicyPatch {
     pub autosnap: Option<bool>,
@@ -460,11 +460,7 @@ impl Config {
             !self.datasets.is_empty(),
             "configuration must contain at least one dataset"
         );
-        validate_batch_sizes(
-            self.settings.snapshot_batch_size,
-            self.settings.prune_batch_size,
-            "settings",
-        )?;
+        self.settings.validate()?;
         validate_prefix(&self.settings.snapshot_prefix)?;
         self.notifications.validate()?;
 
@@ -525,6 +521,28 @@ impl Config {
         policy.apply(&section.policy);
         Ok(policy)
     }
+}
+
+impl Settings {
+    fn validate(&self) -> Result<()> {
+        validate_batch_sizes(self.snapshot_batch_size, self.prune_batch_size, "settings")?;
+        ensure_nonempty_path(&self.lock_file, "settings.lock_file")?;
+        ensure_nonempty_path(&self.zfs_command, "settings.zfs_command")?;
+        ensure_nonempty_path(&self.zpool_command, "settings.zpool_command")?;
+        ensure!(
+            self.lock_file.file_name().is_some(),
+            "settings.lock_file must name a file, not a directory"
+        );
+        Ok(())
+    }
+}
+
+fn ensure_nonempty_path(path: &Path, field: &str) -> Result<()> {
+    ensure!(
+        !path.as_os_str().is_empty() && !path.to_string_lossy().trim().is_empty(),
+        "{field} cannot be empty"
+    );
+    Ok(())
 }
 
 fn validate_batch_sizes(snapshot: usize, prune: usize, context: &str) -> Result<()> {
@@ -785,6 +803,23 @@ prune_batch_size = 129
                 .to_string()
                 .contains("prune_batch_size must be between 1 and 128")
         );
+    }
+
+    #[test]
+    fn rejects_empty_runtime_paths() {
+        for (field, message) in [
+            ("lock_file", "settings.lock_file"),
+            ("zfs_command", "settings.zfs_command"),
+            ("zpool_command", "settings.zpool_command"),
+        ] {
+            let raw = config_with_notifications(&format!("[settings]\n{field} = \"\"\n"));
+            let error = toml::from_str::<Config>(&raw)
+                .unwrap()
+                .validate()
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains(message), "{error}");
+        }
     }
 
     #[test]

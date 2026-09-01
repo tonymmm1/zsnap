@@ -251,6 +251,140 @@ use_templates = ["test"]
     );
 }
 
+#[test]
+fn migrates_sanoid_to_a_new_valid_file_without_loading_zfs_config() {
+    let directory = tempdir().unwrap();
+    let input = directory.path().join("sanoid.conf");
+    let defaults = directory.path().join("sanoid.defaults.conf");
+    let output = directory.path().join("zsnap.toml");
+    let source = r#"
+[tank/data]
+use_template = production
+recursive = yes
+
+[template_production]
+autosnap = yes
+autoprune = yes
+hourly = 24
+daily = 7
+weekly = 4
+monthly = 3
+yearly = 0
+"#;
+    fs::write(&input, source).unwrap();
+    fs::write(
+        &defaults,
+        "[version]\nversion = 2\n[template_default]\nhourly = 48\ndaily = 90\n",
+    )
+    .unwrap();
+
+    let migration = Command::new(env!("CARGO_BIN_EXE_zsnap"))
+        .args([
+            "--config",
+            directory
+                .path()
+                .join("does-not-exist.toml")
+                .to_str()
+                .unwrap(),
+            "migrate-sanoid",
+            "--input",
+            input.to_str().unwrap(),
+            "--output",
+            output.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        migration.status.success(),
+        "{}",
+        String::from_utf8_lossy(&migration.stderr)
+    );
+    assert_eq!(fs::read_to_string(&input).unwrap(), source);
+    assert_eq!(
+        fs::metadata(&output).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    let generated = fs::read_to_string(&output).unwrap();
+    assert!(generated.contains("Existing unmarked Sanoid snapshots are never pruned"));
+
+    let check = Command::new(env!("CARGO_BIN_EXE_zsnap"))
+        .args(["--config", output.to_str().unwrap(), "check"])
+        .output()
+        .unwrap();
+    assert!(
+        check.status.success(),
+        "{}",
+        String::from_utf8_lossy(&check.stderr)
+    );
+
+    let original_output = fs::read(&output).unwrap();
+    let overwrite = Command::new(env!("CARGO_BIN_EXE_zsnap"))
+        .args([
+            "migrate-sanoid",
+            "--input",
+            input.to_str().unwrap(),
+            "--output",
+            output.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(!overwrite.status.success());
+    assert!(String::from_utf8_lossy(&overwrite.stderr).contains("refusing to overwrite"));
+    assert_eq!(fs::read(&output).unwrap(), original_output);
+}
+
+#[test]
+fn invalid_config_never_reaches_zfs_for_snapshot_prune_or_run() {
+    let directory = tempdir().unwrap();
+    let zfs = directory.path().join("zfs");
+    let zpool = directory.path().join("zpool");
+    let calls = directory.path().join("unexpected-zfs-call");
+    let config = directory.path().join("invalid.toml");
+    let marker_script = format!("#!/bin/sh\nprintf called > '{}'\n", calls.display());
+    write_executable(&zfs, &marker_script);
+    write_executable(&zpool, &marker_script);
+    fs::write(
+        &config,
+        format!(
+            r#"version = 1
+[settings]
+snapshot_batch_size = 0
+zfs_command = "{}"
+zpool_command = "{}"
+[datasets."tank/data"]
+"#,
+            zfs.display(),
+            zpool.display()
+        ),
+    )
+    .unwrap();
+
+    for command in ["snapshot", "prune", "run"] {
+        let output = Command::new(env!("CARGO_BIN_EXE_zsnap"))
+            .args(["--config", config.to_str().unwrap(), command, "--dry-run"])
+            .output()
+            .unwrap();
+        assert!(
+            !output.status.success(),
+            "invalid {command} unexpectedly passed"
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("snapshot_batch_size"),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let check = Command::new(env!("CARGO_BIN_EXE_zsnap"))
+        .args(["--config", config.to_str().unwrap(), "check"])
+        .output()
+        .unwrap();
+    assert!(!check.status.success());
+    assert!(
+        !calls.exists(),
+        "invalid configuration invoked a ZFS command"
+    );
+}
+
 fn write_executable(path: &std::path::Path, contents: &str) {
     fs::write(path, contents).unwrap();
     let mut permissions = fs::metadata(path).unwrap().permissions();
