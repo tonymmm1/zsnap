@@ -5,15 +5,16 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use anyhow::{Context, Result, anyhow, bail};
-use chrono::Utc;
+use chrono::{Local, Utc};
 use clap::{Parser, Subcommand, ValueEnum};
 use serde::Serialize;
-use zsnap::config::Config;
+use zsnap::config::{Config, ScheduleTimezone};
 use zsnap::executor::{ExecutionReport, execute};
 use zsnap::lock::RunLock;
 use zsnap::migration::convert_sanoid;
 use zsnap::notification::{self, DeliveryEvent, NotificationReport};
 use zsnap::planner::{Plan, build_plan, resolve_datasets};
+use zsnap::status::StatusCache;
 use zsnap::zfs::Inventory;
 
 #[derive(Debug, Parser)]
@@ -60,6 +61,13 @@ enum Commands {
         /// Restrict the plan to one action type.
         #[arg(long, value_enum, default_value_t = PlanScope::All)]
         scope: PlanScope,
+    },
+    /// Show cached pool, dataset, and snapshot inventory statistics.
+    #[command(alias = "info")]
+    Status {
+        /// Query ZFS now and atomically replace the reporting cache.
+        #[arg(long)]
+        refresh: bool,
     },
     /// Validate the configuration, optionally probing ZFS as well.
     Check {
@@ -111,6 +119,13 @@ struct RunSummary {
     pools: usize,
 }
 
+#[derive(Serialize)]
+struct StatusOutput<'a> {
+    source: &'a str,
+    cache_file: String,
+    status: &'a StatusCache,
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     if let Commands::MigrateSanoid {
@@ -128,6 +143,9 @@ fn main() -> Result<()> {
     }
     if let Commands::NotifyTest { message } = &cli.command {
         return notify_test(&config, message, cli.json);
+    }
+    if let Commands::Status { refresh } = &cli.command {
+        return show_status(&config, *refresh, cli.json, cli.verbose);
     }
 
     let notification_command = mutating_command(&cli.command);
@@ -189,9 +207,10 @@ fn run_zfs_command(cli: &Cli, config: &Config) -> Result<RunSummary> {
         Commands::Snapshot { dry_run } => (PlanScope::Snapshot, *dry_run, true),
         Commands::Prune { dry_run } => (PlanScope::Prune, *dry_run, true),
         Commands::Plan { scope } => (*scope, true, false),
-        Commands::Check { .. } | Commands::MigrateSanoid { .. } | Commands::NotifyTest { .. } => {
-            unreachable!()
-        }
+        Commands::Check { .. }
+        | Commands::Status { .. }
+        | Commands::MigrateSanoid { .. }
+        | Commands::NotifyTest { .. } => unreachable!(),
     };
 
     // Hold the lock across discovery, planning, and mutation so two invocations cannot race.
@@ -200,8 +219,10 @@ fn run_zfs_command(cli: &Cli, config: &Config) -> Result<RunSummary> {
     } else {
         None
     };
+    let inventory_started = Instant::now();
     let inventory =
         Inventory::discover(&config.settings, config.datasets.keys().map(String::as_str))?;
+    let inventory_elapsed = inventory_started.elapsed();
     let resolved = resolve_datasets(config, &inventory)?;
     let mut plan = build_plan(config, &inventory, &resolved, Utc::now())?;
     filter_plan(&mut plan, scope);
@@ -216,10 +237,30 @@ fn run_zfs_command(cli: &Cli, config: &Config) -> Result<RunSummary> {
     }
 
     let mut report = execute(&plan, &config.settings, dry_run, cli.verbose)?;
+    let core_elapsed = overall_started.elapsed();
+    if !dry_run && report.succeeded() {
+        let cache = StatusCache::from_inventory(
+            &inventory,
+            config.datasets.keys().cloned(),
+            inventory_elapsed,
+            Some(&plan),
+        );
+        match cache.write_atomic(&config.settings.cache_file) {
+            Ok(()) if cli.verbose => report.logs.push(format!(
+                "[status] updated reporting cache {}",
+                config.settings.cache_file.display()
+            )),
+            Ok(()) => {}
+            Err(error) => eprintln!(
+                "CACHE WARNING: failed to update {}: {error:#}",
+                config.settings.cache_file.display()
+            ),
+        }
+    }
     if cli.verbose {
         report.logs.push(format!(
             "[overall] timing: core run {:.3} ms (discovery, planning, and pool execution)",
-            overall_started.elapsed().as_secs_f64() * 1_000.0
+            core_elapsed.as_secs_f64() * 1_000.0
         ));
     }
     print_report(&plan, &report, cli.json, cli.verbose)?;
@@ -245,6 +286,116 @@ fn mutating_command(command: &Commands) -> Option<&'static str> {
         Commands::Snapshot { dry_run: false } => Some("snapshot"),
         Commands::Prune { dry_run: false } => Some("prune"),
         _ => None,
+    }
+}
+
+fn show_status(config: &Config, refresh: bool, json: bool, verbose: bool) -> Result<()> {
+    let cache_path = &config.settings.cache_file;
+    let (cache, source) = if refresh || !cache_path.exists() {
+        let _lock = RunLock::acquire(&config.settings.lock_file)?;
+        let inventory_started = Instant::now();
+        let inventory =
+            Inventory::discover(&config.settings, config.datasets.keys().map(String::as_str))?;
+        let cache = StatusCache::from_inventory(
+            &inventory,
+            config.datasets.keys().cloned(),
+            inventory_started.elapsed(),
+            None,
+        );
+        cache.write_atomic(cache_path)?;
+        (cache, if refresh { "refreshed" } else { "created" })
+    } else {
+        (
+            StatusCache::load(cache_path).with_context(|| {
+                format!(
+                    "rerun `zsnap status --refresh` to rebuild {}",
+                    cache_path.display()
+                )
+            })?,
+            "cache",
+        )
+    };
+
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&StatusOutput {
+                source,
+                cache_file: cache_path.display().to_string(),
+                status: &cache,
+            })?
+        );
+        return Ok(());
+    }
+
+    let generated_at = match config.settings.timezone {
+        ScheduleTimezone::Local => cache.generated_at.with_timezone(&Local).to_rfc3339(),
+        ScheduleTimezone::Utc => cache.generated_at.to_rfc3339(),
+    };
+    let other_snapshots = cache
+        .totals
+        .snapshots
+        .saturating_sub(cache.totals.managed_snapshots);
+    let pool_names = cache
+        .pools
+        .iter()
+        .map(|pool| pool.name.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    println!("status source: {source} ({})", cache_path.display());
+    println!(
+        "updated: {generated_at} ({})",
+        format_cache_age(cache.generated_at)
+    );
+    println!(
+        "scope: {} configured root(s), inventory scan {} ms",
+        cache.scope_roots.len(),
+        cache.inventory_scan_milliseconds
+    );
+    if pool_names.is_empty() {
+        println!("zpools: 0");
+    } else {
+        println!("zpools: {} ({pool_names})", cache.totals.pools);
+    }
+    println!("datasets: {}", cache.totals.datasets);
+    println!(
+        "snapshots: {} ({} zsnap-managed, {other_snapshots} other)",
+        cache.totals.snapshots, cache.totals.managed_snapshots
+    );
+
+    if verbose {
+        println!("pool details:");
+        for pool in &cache.pools {
+            let capacity = pool
+                .capacity_percent
+                .map(|capacity| format!("{capacity}% capacity"))
+                .unwrap_or_else(|| "capacity unavailable".to_owned());
+            println!(
+                "  {}: {capacity}, {} dataset(s), {} snapshot(s) ({} managed)",
+                pool.name, pool.datasets, pool.snapshots, pool.managed_snapshots
+            );
+        }
+        println!("dataset details:");
+        for dataset in &cache.datasets {
+            println!(
+                "  {}: {} snapshot(s) ({} managed)",
+                dataset.name, dataset.snapshots, dataset.managed_snapshots
+            );
+        }
+    }
+    Ok(())
+}
+
+fn format_cache_age(generated_at: chrono::DateTime<Utc>) -> String {
+    let seconds = Utc::now().signed_duration_since(generated_at).num_seconds();
+    if seconds < 0 {
+        return format!("{} s in the future", seconds.unsigned_abs());
+    }
+    match seconds {
+        0..=59 => format!("{seconds} s ago"),
+        60..=3_599 => format!("{} min ago", seconds / 60),
+        3_600..=86_399 => format!("{} h ago", seconds / 3_600),
+        _ => format!("{} d ago", seconds / 86_400),
     }
 }
 

@@ -227,6 +227,7 @@ write_zsnap_config() {
         printf 'snapshot_batch_size = %s\n' "${scenario_snap_batch[$index]}"
         printf 'prune_batch_size = %s\n' "${scenario_prune_batch[$index]}"
         printf 'lock_file = "%s/zsnap.lock"\n' "$WORK_DIR"
+        printf 'cache_file = "%s/zsnap.cache"\n' "$WORK_DIR"
         printf 'zfs_command = "%s"\nzpool_command = "%s"\n\n' "$ZFS_BIN" "$ZPOOL_BIN"
         printf '[notifications]\nenabled = false\n\n[templates.benchmark]\n'
         printf 'autosnap = %s\nautoprune = %s\n' "$autosnap" "$autoprune"

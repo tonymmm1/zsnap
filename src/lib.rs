@@ -5,4 +5,5 @@ pub mod migration;
 pub mod model;
 pub mod notification;
 pub mod planner;
+pub mod status;
 pub mod zfs;

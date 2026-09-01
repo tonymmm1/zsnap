@@ -25,6 +25,8 @@ snapshot_batch_size = 128
 prune_batch_size = 64
 
 lock_file = "/run/zsnap/zsnap.lock"
+# Reporting-only status summary. Snapshot and prune decisions never read this file.
+cache_file = "/etc/zsnap/zsnap.cache"
 zfs_command = "zfs"
 zpool_command = "zpool"
 

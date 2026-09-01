@@ -10,6 +10,7 @@ use crate::model::SnapshotKind;
 
 const DEFAULT_PREFIX: &str = "autosnap";
 const DEFAULT_LOCK_FILE: &str = "/run/zsnap/zsnap.lock";
+const DEFAULT_CACHE_FILE: &str = "/etc/zsnap/zsnap.cache";
 const MAX_SNAPSHOT_BATCH_SIZE: usize = 256;
 const MAX_PRUNE_BATCH_SIZE: usize = 128;
 const POLICY_KEYS: &[&str] = &[
@@ -180,6 +181,7 @@ pub struct Settings {
     pub snapshot_batch_size: usize,
     pub prune_batch_size: usize,
     pub lock_file: PathBuf,
+    pub cache_file: PathBuf,
     pub zfs_command: PathBuf,
     pub zpool_command: PathBuf,
 }
@@ -193,6 +195,7 @@ impl Default for Settings {
             snapshot_batch_size: 128,
             prune_batch_size: 64,
             lock_file: PathBuf::from(DEFAULT_LOCK_FILE),
+            cache_file: PathBuf::from(DEFAULT_CACHE_FILE),
             zfs_command: PathBuf::from("zfs"),
             zpool_command: PathBuf::from("zpool"),
         }
@@ -786,11 +789,16 @@ impl Settings {
     fn validate(&self) -> Result<()> {
         validate_batch_sizes(self.snapshot_batch_size, self.prune_batch_size, "settings")?;
         ensure_nonempty_path(&self.lock_file, "settings.lock_file")?;
+        ensure_nonempty_path(&self.cache_file, "settings.cache_file")?;
         ensure_nonempty_path(&self.zfs_command, "settings.zfs_command")?;
         ensure_nonempty_path(&self.zpool_command, "settings.zpool_command")?;
         ensure!(
             self.lock_file.file_name().is_some(),
             "settings.lock_file must name a file, not a directory"
+        );
+        ensure!(
+            self.cache_file.file_name().is_some(),
+            "settings.cache_file must name a file, not a directory"
         );
         Ok(())
     }
@@ -1104,6 +1112,7 @@ prune_batch_size = 129
     fn rejects_empty_runtime_paths() {
         for (field, message) in [
             ("lock_file", "settings.lock_file"),
+            ("cache_file", "settings.cache_file"),
             ("zfs_command", "settings.zfs_command"),
             ("zpool_command", "settings.zpool_command"),
         ] {

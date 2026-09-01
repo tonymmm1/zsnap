@@ -27,6 +27,8 @@ max_parallel_pools = 0
 snapshot_batch_size = 128
 prune_batch_size = 64
 lock_file = "/run/zsnap/zsnap.lock"
+# Reporting only; never used for snapshot or prune decisions.
+cache_file = "/etc/zsnap/zsnap.cache"
 zfs_command = "zfs"
 zpool_command = "zpool"
 

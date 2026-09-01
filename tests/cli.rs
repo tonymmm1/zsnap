@@ -13,6 +13,7 @@ fn plans_and_executes_against_fake_zfs_tools() {
     let zpool = directory.path().join("zpool");
     let calls = directory.path().join("calls.log");
     let lock = directory.path().join("zsnap.lock");
+    let cache = directory.path().join("zsnap.cache");
     let config = directory.path().join("zsnap.toml");
 
     write_executable(
@@ -54,6 +55,7 @@ esac
 zfs_command = "{}"
 zpool_command = "{}"
 lock_file = "{}"
+cache_file = "{}"
 max_parallel_pools = 0
 
 [template_test]
@@ -74,7 +76,8 @@ use_templates = [test]
 "#,
             zfs.display(),
             zpool.display(),
-            lock.display()
+            lock.display(),
+            cache.display()
         ),
     )
     .unwrap();
@@ -135,6 +138,37 @@ use_templates = [test]
     let report: Value = serde_json::from_slice(&run.stdout).unwrap();
     assert_eq!(report["snapshots_created"], 2);
     assert_eq!(calls_for(&calls, "snapshot"), 2); // One batched call per independent pool.
+    assert!(cache.exists(), "successful run did not update status cache");
+
+    let status = Command::new(env!("CARGO_BIN_EXE_zsnap"))
+        .args(["--config", config.to_str().unwrap(), "--json", "status"])
+        .output()
+        .unwrap();
+    assert!(
+        status.status.success(),
+        "{}",
+        String::from_utf8_lossy(&status.stderr)
+    );
+    let status: Value = serde_json::from_slice(&status.stdout).unwrap();
+    assert_eq!(status["source"], "cache");
+    assert_eq!(status["status"]["totals"]["pools"], 2);
+    assert_eq!(status["status"]["totals"]["datasets"], 4);
+    assert_eq!(status["status"]["totals"]["snapshots"], 2);
+    assert_eq!(status["status"]["totals"]["managed_snapshots"], 2);
+
+    let info = Command::new(env!("CARGO_BIN_EXE_zsnap"))
+        .args(["--config", config.to_str().unwrap(), "info", "-v"])
+        .output()
+        .unwrap();
+    assert!(
+        info.status.success(),
+        "{}",
+        String::from_utf8_lossy(&info.stderr)
+    );
+    let info = String::from_utf8_lossy(&info.stdout);
+    assert!(info.contains("zpools: 2 (backup, tank)"), "{info}");
+    assert!(info.contains("pool details:"), "{info}");
+    assert!(info.contains("dataset details:"), "{info}");
 }
 
 #[test]
@@ -169,6 +203,88 @@ fn installed_starter_configuration_never_assumes_a_dataset() {
             .to_string()
             .contains("at least one dataset")
     );
+}
+
+#[test]
+fn status_refreshes_atomically_then_reads_without_querying_zfs() {
+    let directory = tempdir().unwrap();
+    let zfs = directory.path().join("zfs");
+    let zpool = directory.path().join("zpool");
+    let config = directory.path().join("zsnap.toml");
+    let cache = directory.path().join("zsnap.cache");
+    let lock = directory.path().join("zsnap.lock");
+
+    write_executable(
+        &zfs,
+        r#"#!/bin/sh
+case "$*" in
+  *filesystem,volume*) printf 'tank\ntank/data\ntank/data/vm\n' ;;
+  *snapshot*) printf 'tank/data@autosnap_hourly\t100\tyes\ntank/data@manual\t90\t-\n' ;;
+  *) exit 64 ;;
+esac
+"#,
+    );
+    write_executable(&zpool, "#!/bin/sh\nprintf 'tank\\t63%%\\n'\n");
+    fs::write(
+        &config,
+        format!(
+            r#"version = 1
+[settings]
+zfs_command = "{}"
+zpool_command = "{}"
+lock_file = "{}"
+cache_file = "{}"
+[tank]
+recursive = true
+"#,
+            zfs.display(),
+            zpool.display(),
+            lock.display(),
+            cache.display()
+        ),
+    )
+    .unwrap();
+
+    let refreshed = Command::new(env!("CARGO_BIN_EXE_zsnap"))
+        .args([
+            "--config",
+            config.to_str().unwrap(),
+            "--json",
+            "status",
+            "--refresh",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        refreshed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&refreshed.stderr)
+    );
+    let refreshed: Value = serde_json::from_slice(&refreshed.stdout).unwrap();
+    assert_eq!(refreshed["source"], "refreshed");
+    assert_eq!(refreshed["status"]["totals"]["pools"], 1);
+    assert_eq!(refreshed["status"]["totals"]["datasets"], 3);
+    assert_eq!(refreshed["status"]["totals"]["snapshots"], 2);
+    assert_eq!(refreshed["status"]["totals"]["managed_snapshots"], 1);
+    assert_eq!(
+        fs::metadata(&cache).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+
+    write_executable(&zfs, "#!/bin/sh\nexit 99\n");
+    write_executable(&zpool, "#!/bin/sh\nexit 99\n");
+    let cached = Command::new(env!("CARGO_BIN_EXE_zsnap"))
+        .args(["--config", config.to_str().unwrap(), "--json", "status"])
+        .output()
+        .unwrap();
+    assert!(
+        cached.status.success(),
+        "{}",
+        String::from_utf8_lossy(&cached.stderr)
+    );
+    let cached: Value = serde_json::from_slice(&cached.stdout).unwrap();
+    assert_eq!(cached["source"], "cache");
+    assert_eq!(cached["status"]["totals"], refreshed["status"]["totals"]);
 }
 
 #[test]

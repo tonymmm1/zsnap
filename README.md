@@ -32,6 +32,8 @@ proposed deletion, and test against a disposable ZFS pool.
 - Supports pre/post snapshot and pruning hooks with timeouts and Sanoid-compatible
   environment aliases.
 - Provides text or JSON plans, non-mutating dry runs, and a process-wide lock.
+- Provides an atomically updated status cache with pool and per-dataset snapshot
+  counts, readable through `status` or its `info` alias.
 - Converts Sanoid `sanoid.conf` policy into validated zsnap TOML without modifying
   the source configuration or querying ZFS.
 
@@ -68,6 +70,7 @@ settings control separate workloads and do not multiply ZFS writes:
 | `settings.max_parallel_pools` | `0` | `0` runs every independent pool concurrently. Keep it for roughly 1-4 pools; use `2` or `4` on hosts with many pools or shared controllers. |
 | `settings.snapshot_batch_size` | `128` | Maximum distinct dataset targets in one ZFS command; valid range `1..=256`. OpenZFS requires separate commands for multiple due names on one dataset. It does not add threads. |
 | `settings.prune_batch_size` | `64` | Maximum snapshot names destroyed per dataset command; valid range `1..=128`. It does not add threads. |
+| `settings.cache_file` | `/etc/zsnap/zsnap.cache` | Reporting-only JSON summary updated after successful mutating runs. It is never used to plan snapshots or pruning. |
 | `notifications.max_parallel` | `4` | Maximum simultaneous HTTP requests, unrelated to pool concurrency. It matters only when more than four webhooks are configured. |
 | `notifications.timeout_seconds` | `10` | Whole-request deadline for each attempt. Increase only for a known slow internal relay. |
 | `notifications.max_attempts` | `3` | Total attempts for transient failures. Keep it low because the systemd job waits for delivery to finish. |
@@ -210,6 +213,9 @@ revalidated, while stale data could delete the wrong snapshot. Batching and
 independent-pool parallelism already produced most of the measured win. Recursive
 destroy and channel-program tradeoffs are discussed in the full report.
 
+The reporting cache used by `zsnap status` contains aggregate counts only. It does
+not contain or replace the live snapshot inventory used for retention decisions.
+
 These are control-path measurements on sparse files, not storage benchmarks.
 They cannot predict physical HDD, SSD, or NVMe behavior. See the
 [`benchmark guide`](benchmarks/README.md),
@@ -298,7 +304,7 @@ For Alpine/OpenRC, use `sudo make install-openrc` followed by
 `PERIODIC_DIR`, `CONFIG_SOURCE`, and packaging `DESTDIR` are overridable. The
 supplied scheduler files assume the default `/usr/local/sbin` and `/etc` locations. `make uninstall`
 handles systemd; `make uninstall-openrc` handles OpenRC. Both deliberately preserve
-the user-edited configuration and webhook environment file.
+the user-edited configuration, webhook environment file, and reporting cache.
 
 ## CI and releases
 
@@ -354,6 +360,7 @@ version = 1
 snapshot_prefix = "autosnap"
 timezone = "local"
 max_parallel_pools = 0
+cache_file = "/etc/zsnap/zsnap.cache"
 
 [template_production]
 autosnap = true
@@ -503,6 +510,14 @@ sudo zsnap check --probe
 # Print all due creates/deletes. Add --json for structured output.
 sudo zsnap plan
 
+# Read the fast reporting cache; `info` is an alias. Add -v for pool/dataset detail.
+sudo zsnap status
+sudo zsnap status -v
+sudo zsnap info
+
+# Force a live inventory scan and atomically replace the cache.
+sudo zsnap status --refresh
+
 # Exercise the exact executor path without mutation or hooks.
 sudo zsnap run --dry-run --verbose
 
@@ -520,6 +535,26 @@ and total wall-clock time for each pool, followed by the overall core-run time.
 Pool timings are intentionally kept separate because independent pools execute in
 parallel and their durations overlap. Dry-run timings measure discovery and command
 preparation, not ZFS mutation speed.
+
+### Cached status
+
+`zsnap status` normally reads `/etc/zsnap/zsnap.cache` without invoking `zfs` or
+`zpool`. Its compact output reports configured zpools, recursively discovered
+datasets, total snapshots, and the subset carrying `org.zsnap:managed=yes`.
+`--verbose` adds counts for every pool and dataset; `--json` emits the same cached
+data as structured output. `zsnap info` is an alias for `zsnap status`.
+
+Every successful non-dry-run `run`, `snapshot`, or `prune` updates the cache while
+holding the normal run lock. This means the installed systemd timer and the
+OpenRC/cron runner refresh it automatically without performing a second inventory
+scan. A failed operation leaves the previous cache intact. If the cache does not
+exist, `status` creates it from a live scan; `status --refresh` always forces a live
+scan. Writes use an adjacent mode-0600 temporary file, synchronization, and atomic
+rename so readers never observe a partial document.
+
+The cache is deliberately reporting-only and scoped to configured roots plus their
+descendants. It stores counts, not a snapshot payload, and is never read by the
+planner or pruner. Live ZFS state remains the authority for every mutation.
 
 `check` is the configuration linter. It validates TOML values and the dataset-header
 shorthand, rejects unknown keys, and verifies value bounds, template references,

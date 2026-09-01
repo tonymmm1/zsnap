@@ -18,6 +18,7 @@ RUST_SOURCES := $(wildcard src/*.rs tests/*.rs)
 CONFIG_TARGET := $(DESTDIR)$(SYSCONFDIR)/zsnap/zsnap.toml
 CONFIG_SOURCE ?= contrib/zsnap.toml.example
 ENV_TARGET := $(DESTDIR)$(SYSCONFDIR)/zsnap/webhooks.env
+CACHE_TARGET := $(DESTDIR)$(SYSCONFDIR)/zsnap/zsnap.cache
 SERVICE_TARGET := $(DESTDIR)$(SYSTEMD_UNIT_DIR)/zsnap.service
 TIMER_TARGET := $(DESTDIR)$(SYSTEMD_UNIT_DIR)/zsnap.timer
 OPENRC_TARGET := $(DESTDIR)$(OPENRC_INIT_DIR)/zsnap
@@ -153,6 +154,7 @@ uninstall-common:
 	rm -f $(DESTDIR)$(BINDIR)/zsnap
 	@echo "retained $(CONFIG_TARGET)"
 	@echo "retained $(ENV_TARGET)"
+	@if [ -e "$(CACHE_TARGET)" ]; then echo "retained $(CACHE_TARGET)"; fi
 
 package:
 	$(CARGO) package --locked
