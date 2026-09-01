@@ -139,9 +139,3 @@ yearly = 0
 # script_timeout = 10
 # no_inconsistent_snapshot = true
 # force_post_snapshot_script = true
-
-# `recursive = "zfs"` uses `zfs snapshot -r` for atomic tree-wide snapshots.
-# Child policy sections are intentionally rejected under an atomic root.
-# [archive/incoming]
-# use_templates = [backup]
-# recursive = "zfs"

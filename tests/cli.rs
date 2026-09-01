@@ -161,6 +161,50 @@ fn installed_starter_configuration_never_assumes_a_dataset() {
 }
 
 #[test]
+fn probe_reports_all_missing_datasets_without_raw_zfs_command_noise() {
+    let directory = tempdir().unwrap();
+    let zfs = directory.path().join("zfs");
+    let zpool = directory.path().join("zpool");
+    let config = directory.path().join("zsnap.toml");
+
+    write_executable(
+        &zfs,
+        "#!/bin/sh\necho \"cannot open 'pool/missing-b': dataset does not exist\" >&2\necho \"cannot open 'pool/missing-a': dataset does not exist\" >&2\nexit 1\n",
+    );
+    write_executable(&zpool, "#!/bin/sh\nexit 99\n");
+    fs::write(
+        &config,
+        format!(
+            r#"version = 1
+
+[settings]
+zfs_command = "{}"
+zpool_command = "{}"
+
+[pool/missing-a]
+
+[pool/missing-b]
+"#,
+            zfs.display(),
+            zpool.display()
+        ),
+    )
+    .unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_zsnap"))
+        .args(["--config", config.to_str().unwrap(), "check", "--probe"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("configured ZFS dataset sections reference missing names"));
+    assert!(stderr.contains("  - pool/missing-a"));
+    assert!(stderr.contains("  - pool/missing-b"));
+    assert!(stderr.contains("correct or remove these sections"));
+    assert!(!stderr.contains("zfs list -H"), "{stderr}");
+}
+
+#[test]
 fn notify_test_requires_an_enabled_target() {
     let directory = tempdir().unwrap();
     let config = directory.path().join("zsnap.toml");

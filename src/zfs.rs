@@ -53,7 +53,7 @@ impl Inventory {
             "name".into(),
         ];
         dataset_args.extend(configured_datasets.iter().map(OsString::from));
-        let datasets_output = run_checked(&settings.zfs_command, &dataset_args)?;
+        let datasets_output = run_dataset_list_checked(&settings.zfs_command, &dataset_args)?;
         let mut snapshot_args: Vec<OsString> = vec![
             "list".into(),
             "-H".into(),
@@ -97,10 +97,38 @@ where
         .into_iter()
         .map(|arg| arg.as_ref().to_owned())
         .collect();
+    let output = run_output(program, &args)?;
+    check_output(program, &args, output)
+}
+
+fn run_dataset_list_checked(program: &Path, args: &[OsString]) -> Result<Output> {
+    let output = run_output(program, args)?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if let Some(missing) = parse_missing_datasets(&stderr) {
+            let list = missing
+                .into_iter()
+                .map(|dataset| format!("  - {dataset}"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            bail!(
+                "configured ZFS dataset sections reference missing names:\n{list}\ncorrect or remove these sections, then rerun `zsnap check --probe`"
+            );
+        }
+    }
+    check_output(program, args, output)
+}
+
+fn run_output(program: &Path, args: &[OsString]) -> Result<Output> {
     let output = Command::new(program)
-        .args(&args)
+        .args(args)
+        .env("LC_ALL", "C")
         .output()
         .with_context(|| format!("failed to execute {}", program.display()))?;
+    Ok(output)
+}
+
+fn check_output(program: &Path, args: &[OsString], output: Output) -> Result<Output> {
     if !output.status.success() {
         let rendered_args = args
             .iter()
@@ -117,6 +145,23 @@ where
         );
     }
     Ok(output)
+}
+
+fn parse_missing_datasets(stderr: &str) -> Option<BTreeSet<String>> {
+    let mut missing = BTreeSet::new();
+    for line in stderr
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+    {
+        let rest = line.strip_prefix("cannot open '")?;
+        let (dataset, reason) = rest.split_once("': ")?;
+        if !matches!(reason, "dataset does not exist" | "no such pool") || dataset.is_empty() {
+            return None;
+        }
+        missing.insert(dataset.to_owned());
+    }
+    (!missing.is_empty()).then_some(missing)
 }
 
 pub fn parse_datasets(output: &str) -> Result<BTreeSet<String>> {
@@ -238,5 +283,25 @@ mod tests {
 
         let pools = parse_pools("tank\t42%\nbackup\t7%\n").unwrap();
         assert_eq!(pools["tank"].capacity_percent, 42);
+    }
+
+    #[test]
+    fn recognizes_only_clean_missing_dataset_diagnostics() {
+        let missing = parse_missing_datasets(
+            "cannot open 'pool/missing-b': dataset does not exist\n\
+             cannot open 'pool/missing-a': dataset does not exist\n",
+        )
+        .unwrap();
+        assert_eq!(
+            missing.into_iter().collect::<Vec<_>>(),
+            ["pool/missing-a", "pool/missing-b"]
+        );
+        assert!(parse_missing_datasets("cannot open 'pool/data': permission denied\n").is_none());
+        assert!(
+            parse_missing_datasets(
+                "cannot open 'missingpool': no such pool\nunrelated diagnostic\n"
+            )
+            .is_none()
+        );
     }
 }
