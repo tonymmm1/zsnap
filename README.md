@@ -316,9 +316,11 @@ test suite, a verified static-musl build, and source builds inside Ubuntu, Debia
 Fedora, CentOS Stream, RHEL UBI, Rocky Linux, Alpine, and Arch containers.
 
 Pushing an annotated `vMAJOR.MINOR.PATCH` tag runs the tests again and creates a
-GitHub release containing static x86-64 and ARM64 archives plus SHA-256 checksum
-files. Each architecture is compiled and smoke-tested on a matching native GitHub
-runner. The tag must exactly match the package version in `Cargo.toml`:
+GitHub release for x86-64 and ARM64. Each architecture is compiled and smoke-tested
+on a matching native GitHub runner. The release contains a portable static archive,
+Debian package, RPM package, Alpine package, Arch Linux package, and an individual
+SHA-256 file for every artifact. The tag must exactly match the package version in
+`Cargo.toml`:
 
 ```console
 git tag -a v0.1.0 -m "zsnap 0.1.0"
@@ -333,6 +335,32 @@ directly; ZFS command-line tools are still required at runtime:
 sha256sum --check zsnap-0.1.0-x86_64-unknown-linux-musl.tar.gz.sha256
 tar -xzf zsnap-0.1.0-x86_64-unknown-linux-musl.tar.gz
 sudo install -m755 zsnap-0.1.0-x86_64-unknown-linux-musl/zsnap /usr/local/sbin/zsnap
+```
+
+Native packages install the binary as `/usr/bin/zsnap`, preserve existing files in
+`/etc/zsnap`, and automatically activate the 15-minute systemd timer or Alpine
+periodic job. The dataset-neutral starter cannot create or prune anything until
+real dataset sections are added. Install the appropriate downloaded package:
+
+```console
+sudo apt install ./zsnap_0.1.0_amd64.deb
+sudo dnf install ./zsnap-0.1.0-1.x86_64.rpm
+sudo apk add --allow-untrusted ./zsnap-0.1.0-x86_64.apk
+sudo pacman -U ./zsnap-0.1.0-1-x86_64.pkg.tar.zst
+```
+
+The APK is an unsigned standalone release artifact, hence `--allow-untrusted`.
+Configure `/etc/zsnap/zsnap.toml`, run `zsnap check --probe`, and review `zsnap plan`
+before the first successful scheduled run. Disable automatic scheduling with
+`systemctl disable --now zsnap.timer`; on Alpine, remove
+`/etc/periodic/15min/zsnap`.
+
+To build all four native package formats locally around the static binary, install
+`nFPM` or use the same pinned, checksum-verified helper as CI:
+
+```console
+./ci/install-nfpm.sh 2.47.0 x86_64 /tmp/zsnap-nfpm
+make packages NFPM=/tmp/zsnap-nfpm/nfpm
 ```
 
 ## Configure

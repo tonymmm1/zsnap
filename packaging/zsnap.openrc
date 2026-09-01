@@ -1,0 +1,26 @@
+#!/sbin/openrc-run
+
+description="Policy-driven ZFS snapshots with zsnap"
+command="/usr/bin/zsnap"
+command_args="--config /etc/zsnap/zsnap.toml run"
+command_user="root"
+
+depend() {
+  need localmount
+  after zfs
+  use logger net
+}
+
+start_pre() {
+  checkpath --directory --mode 0750 /run/zsnap
+  if [ ! -r /etc/zsnap/zsnap.toml ]; then
+    eerror "missing /etc/zsnap/zsnap.toml"
+    return 1
+  fi
+  if [ -r /etc/zsnap/webhooks.env ]; then
+    set -a
+    # shellcheck disable=SC1091
+    . /etc/zsnap/webhooks.env
+    set +a
+  fi
+}

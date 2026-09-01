@@ -14,6 +14,9 @@ STATIC_TARGET ?= x86_64-unknown-linux-musl
 MUSL_CC ?= cc
 STATIC_BINARY := target/$(STATIC_TARGET)/release/zsnap
 STATIC_TARGET_ENV := $(shell printf '%s' '$(STATIC_TARGET)' | tr '[:lower:]-' '[:upper:]_')
+PACKAGE_VERSION ?= $(shell sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n 1)
+PACKAGE_ARCH ?= $(if $(findstring aarch64,$(STATIC_TARGET)),arm64,amd64)
+NFPM ?= nfpm
 RUST_SOURCES := $(wildcard src/*.rs tests/*.rs)
 CONFIG_TARGET := $(DESTDIR)$(SYSCONFDIR)/zsnap/zsnap.toml
 CONFIG_SOURCE ?= contrib/zsnap.toml.example
@@ -28,7 +31,7 @@ PERIODIC_TARGET := $(DESTDIR)$(PERIODIC_DIR)/zsnap
 	install-static-binary install-config install-systemd install-openrc install-static-openrc \
 	install-openrc-service install-none install-static-none enable enable-openrc disable \
 	disable-openrc uninstall uninstall-systemd uninstall-openrc uninstall-common clean package \
-	static verify verify-static
+	packages static verify verify-static
 
 all: build
 
@@ -158,6 +161,10 @@ uninstall-common:
 
 package:
 	$(CARGO) package --locked
+
+# Builds deb, rpm, apk, and Arch Linux packages around the static binary.
+packages: $(STATIC_BINARY)
+	NFPM="$(NFPM)" ./ci/package-native.sh "$(STATIC_TARGET)" "$(PACKAGE_VERSION)" "$(PACKAGE_ARCH)"
 
 # Requires the musl target: rustup target add x86_64-unknown-linux-musl
 static:

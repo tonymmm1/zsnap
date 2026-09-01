@@ -1,0 +1,10 @@
+#!/bin/sh
+
+# Installed as /etc/periodic/15min/zsnap by the Alpine package.
+if [ -r /etc/zsnap/webhooks.env ]; then
+  set -a
+  # shellcheck disable=SC1091
+  . /etc/zsnap/webhooks.env
+  set +a
+fi
+exec /usr/bin/zsnap --config /etc/zsnap/zsnap.toml run

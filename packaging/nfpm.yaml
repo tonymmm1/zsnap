@@ -1,0 +1,107 @@
+# yaml-language-server: $schema=https://nfpm.goreleaser.com/schema.json
+name: zsnap
+arch: ${PACKAGE_ARCH}
+platform: linux
+version: ${PACKAGE_VERSION}
+version_schema: semver
+release: 1
+section: admin
+priority: optional
+maintainer: zsnap contributors <tonymmm1@users.noreply.github.com>
+description: |-
+  Fast, policy-driven ZFS snapshot management.
+  zsnap creates and prunes marked snapshots with bounded parallelism across
+  zpools, strict TOML configuration, safe Sanoid migration, and notifications.
+vendor: zsnap contributors
+homepage: https://github.com/tonymmm1/zsnap
+license: MIT
+scripts:
+  postinstall: packaging/postinstall.sh
+  postremove: packaging/postremove.sh
+contents:
+  - src: ${PACKAGE_BINARY}
+    dst: /usr/bin/zsnap
+    expand: true
+    file_info:
+      mode: 0755
+  - dst: /etc/zsnap
+    type: dir
+    file_info:
+      mode: 0750
+  - src: contrib/zsnap.toml.example
+    dst: /etc/zsnap/zsnap.toml
+    type: config|noreplace
+    file_info:
+      mode: 0600
+  - src: contrib/webhooks.env.example
+    dst: /etc/zsnap/webhooks.env
+    type: config|noreplace
+    file_info:
+      mode: 0600
+  - src: README.md
+    dst: /usr/share/doc/zsnap/README.md
+    file_info:
+      mode: 0644
+  - src: LICENSE
+    dst: /usr/share/licenses/zsnap/LICENSE
+    file_info:
+      mode: 0644
+  - src: config.example.toml
+    dst: /usr/share/doc/zsnap/examples/zsnap.toml
+    file_info:
+      mode: 0644
+  - src: packaging/zsnap.periodic
+    dst: /usr/share/zsnap/zsnap.periodic
+    packager: deb
+    file_info:
+      mode: 0755
+  - src: packaging/zsnap.periodic
+    dst: /usr/share/zsnap/zsnap.periodic
+    packager: rpm
+    file_info:
+      mode: 0755
+  - src: packaging/zsnap.periodic
+    dst: /usr/share/zsnap/zsnap.periodic
+    packager: archlinux
+    file_info:
+      mode: 0755
+  - src: packaging/zsnap.periodic
+    dst: /etc/periodic/15min/zsnap
+    packager: apk
+    file_info:
+      mode: 0755
+  - src: packaging/zsnap.service
+    dst: /usr/lib/systemd/system/zsnap.service
+    packager: deb
+    file_info:
+      mode: 0644
+  - src: contrib/zsnap.timer
+    dst: /usr/lib/systemd/system/zsnap.timer
+    packager: deb
+    file_info:
+      mode: 0644
+  - src: packaging/zsnap.service
+    dst: /usr/lib/systemd/system/zsnap.service
+    packager: rpm
+    file_info:
+      mode: 0644
+  - src: contrib/zsnap.timer
+    dst: /usr/lib/systemd/system/zsnap.timer
+    packager: rpm
+    file_info:
+      mode: 0644
+  - src: packaging/zsnap.service
+    dst: /usr/lib/systemd/system/zsnap.service
+    packager: archlinux
+    file_info:
+      mode: 0644
+  - src: contrib/zsnap.timer
+    dst: /usr/lib/systemd/system/zsnap.timer
+    packager: archlinux
+    file_info:
+      mode: 0644
+  - src: packaging/zsnap.openrc
+    dst: /etc/init.d/zsnap
+    packager: apk
+    file_info:
+      mode: 0755
