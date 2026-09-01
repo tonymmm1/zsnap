@@ -97,6 +97,7 @@ use_templates = [test]
             "--config",
             config.to_str().unwrap(),
             "--json",
+            "--verbose",
             "run",
             "--dry-run",
         ])
@@ -107,6 +108,16 @@ use_templates = [test]
         "{}",
         String::from_utf8_lossy(&dry_run.stderr)
     );
+    let dry_run_report: Value = serde_json::from_slice(&dry_run.stdout).unwrap();
+    let dry_run_logs = dry_run_report["logs"].as_array().unwrap();
+    assert!(dry_run_logs.iter().any(|line| {
+        line.as_str()
+            .is_some_and(|line| line.starts_with("[tank] timing:"))
+    }));
+    assert!(dry_run_logs.iter().any(|line| {
+        line.as_str()
+            .is_some_and(|line| line.starts_with("[overall] timing: core run "))
+    }));
     assert!(
         !calls.exists(),
         "dry-run unexpectedly invoked a mutating fake-ZFS command"

@@ -114,6 +114,7 @@ pub fn execute(
 }
 
 fn execute_pool(work: PoolWork, settings: &Settings, dry_run: bool, verbose: bool) -> PoolResult {
+    let pool_started = Instant::now();
     let mut result = PoolResult {
         pool: work.pool.clone(),
         ..PoolResult::default()
@@ -123,6 +124,7 @@ fn execute_pool(work: PoolWork, settings: &Settings, dry_run: bool, verbose: boo
             .logs
             .push(format!("[{}] starting pool work", work.pool));
     }
+    let snapshot_started = Instant::now();
     let mut snapshot_failed = false;
     let mut batchable_regular = Vec::new();
     let mut batchable_recursive = Vec::new();
@@ -146,6 +148,7 @@ fn execute_pool(work: PoolWork, settings: &Settings, dry_run: bool, verbose: boo
             snapshot_failed = true;
         }
     }
+    let snapshot_elapsed = snapshot_started.elapsed();
 
     if snapshot_failed && !work.prunes.is_empty() {
         result.prunes_skipped = work.prunes.iter().map(|action| action.names.len()).sum();
@@ -153,15 +156,34 @@ fn execute_pool(work: PoolWork, settings: &Settings, dry_run: bool, verbose: boo
             "[{}] skipped {} prune(s) because snapshot creation or a snapshot hook failed",
             work.pool, result.prunes_skipped
         ));
+        if verbose {
+            result.logs.push(format!(
+                "[{}] timing: snapshots {:.3} ms, pruning skipped, pool total {:.3} ms",
+                work.pool,
+                snapshot_elapsed.as_secs_f64() * 1_000.0,
+                pool_started.elapsed().as_secs_f64() * 1_000.0
+            ));
+        }
         return result;
     }
 
+    let prune_started = Instant::now();
     for action in work.prunes {
         if action.policy.has_prune_hooks() {
             execute_hooked_prunes(&action, settings, dry_run, &mut result);
         } else {
             execute_prune_batches(&action, settings, dry_run, &mut result);
         }
+    }
+    let prune_elapsed = prune_started.elapsed();
+    if verbose {
+        result.logs.push(format!(
+            "[{}] timing: snapshots {:.3} ms, pruning {:.3} ms, pool total {:.3} ms",
+            work.pool,
+            snapshot_elapsed.as_secs_f64() * 1_000.0,
+            prune_elapsed.as_secs_f64() * 1_000.0,
+            pool_started.elapsed().as_secs_f64() * 1_000.0
+        ));
     }
     result
 }
@@ -615,6 +637,43 @@ mod tests {
         assert_eq!(calls.lines().count(), 1);
         assert!(calls.contains("tank/a@autosnap_a_hourly"));
         assert!(calls.contains("tank/b@autosnap_b_hourly"));
+    }
+
+    #[test]
+    fn verbose_execution_reports_snapshot_prune_and_pool_timings() {
+        let settings = Settings {
+            zfs_command: "/bin/true".into(),
+            ..Settings::default()
+        };
+        let policy = Policy::default();
+        let plan = Plan {
+            snapshots: vec![SnapshotAction {
+                pool: "tank".to_owned(),
+                dataset: "tank/data".to_owned(),
+                recursive: false,
+                names: vec!["autosnap_new_hourly".to_owned()],
+                kinds: vec![],
+                policy: policy.clone(),
+            }],
+            prunes: vec![PruneAction {
+                pool: "tank".to_owned(),
+                dataset: "tank/data".to_owned(),
+                names: vec!["autosnap_old_hourly".to_owned()],
+                policy,
+            }],
+            ..Plan::default()
+        };
+
+        let report = execute(&plan, &settings, false, true).unwrap();
+        assert!(report.succeeded(), "{:?}", report.errors);
+        let timing = report
+            .logs
+            .iter()
+            .find(|line| line.starts_with("[tank] timing:"))
+            .expect("missing verbose pool timing");
+        assert!(timing.contains("snapshots "));
+        assert!(timing.contains("pruning "));
+        assert!(timing.contains("pool total "));
     }
 
     #[test]

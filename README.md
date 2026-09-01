@@ -515,6 +515,12 @@ sudo zsnap prune
 sudo zsnap notify-test
 ```
 
+Verbose snapshot, prune, and combined runs report snapshot time, pruning time,
+and total wall-clock time for each pool, followed by the overall core-run time.
+Pool timings are intentionally kept separate because independent pools execute in
+parallel and their durations overlap. Dry-run timings measure discovery and command
+preparation, not ZFS mutation speed.
+
 `check` is the configuration linter. It validates TOML values and the dataset-header
 shorthand, rejects unknown keys, and verifies value bounds, template references,
 recursion combinations, dataset names, hooks, and webhook settings. Every

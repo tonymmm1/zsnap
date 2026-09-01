@@ -183,6 +183,7 @@ fn main() -> Result<()> {
 }
 
 fn run_zfs_command(cli: &Cli, config: &Config) -> Result<RunSummary> {
+    let overall_started = Instant::now();
     let (scope, dry_run, execute_actions) = match &cli.command {
         Commands::Run { dry_run } => (PlanScope::All, *dry_run, true),
         Commands::Snapshot { dry_run } => (PlanScope::Snapshot, *dry_run, true),
@@ -214,7 +215,13 @@ fn run_zfs_command(cli: &Cli, config: &Config) -> Result<RunSummary> {
         });
     }
 
-    let report = execute(&plan, &config.settings, dry_run, cli.verbose)?;
+    let mut report = execute(&plan, &config.settings, dry_run, cli.verbose)?;
+    if cli.verbose {
+        report.logs.push(format!(
+            "[overall] timing: core run {:.3} ms (discovery, planning, and pool execution)",
+            overall_started.elapsed().as_secs_f64() * 1_000.0
+        ));
+    }
     print_report(&plan, &report, cli.json, cli.verbose)?;
     if !report.succeeded() {
         bail!(
