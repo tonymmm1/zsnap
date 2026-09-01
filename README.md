@@ -17,8 +17,8 @@ proposed deletion, and test against a disposable ZFS pool.
 
 ## What it does
 
-- Creates frequent, hourly, daily, weekly, monthly, and yearly snapshots on UTC
-  schedules.
+- Creates frequent, hourly, daily, weekly, monthly, and yearly snapshots using the
+  host timezone by default, with an explicit UTC mode.
 - Applies ordered templates, recursive dataset policies, and per-dataset overrides.
 - Supports both individually managed descendants and atomic `zfs snapshot -r` trees.
 - Uses Sanoid-compatible names such as
@@ -318,6 +318,7 @@ version = 1
 
 [settings]
 snapshot_prefix = "autosnap"
+timezone = "local"
 max_parallel_pools = 0
 
 [templates.production]
@@ -418,11 +419,17 @@ Provider setup details are in the official
 
 ### Schedules and retention
 
-Schedules use UTC, which avoids daylight-saving duplicate and missing hours.
-Defaults intentionally track Sanoid's general policy: hourly at minute 0, daily at
-23:59, weekly Monday at 23:30, monthly on day 1, and yearly on January 1. Days of
-the week use ISO numbering (`1 = Monday`, `7 = Sunday`). Monthly days are limited
-to 1 through 28 so every configured date exists.
+Schedules and snapshot-name timestamps use the host timezone by default. Set
+`settings.timezone = "utc"` to use UTC instead; `"local"` and `"host"` select the
+host timezone. Defaults intentionally track Sanoid's general policy: hourly at
+minute 0, daily at 23:59, weekly Monday at 23:30, monthly on day 1, and yearly on
+January 1. Days of the week use ISO numbering (`1 = Monday`, `7 = Sunday`). Monthly
+days are limited to 1 through 28 so every configured date exists.
+
+During a repeated daylight-saving hour, both real occurrences can become due and
+the later occurrence receives Sanoid's `dst` snapshot-name suffix to avoid a name
+collision. A configured civil time skipped by a forward clock transition is moved
+forward by the size of that gap. Retention ages always use real elapsed time.
 
 Setting a retention class to `0` disables new snapshots of that class and prunes
 all owned snapshots in that class when `autoprune = true`. `prune_defer = 70`
@@ -505,12 +512,12 @@ source, disables Sanoid, or installs/enables a service.
 Retention, schedules, ordered templates, dataset overrides, `path`, recursion,
 `process_children_only`, prune deferral, and hooks are converted. Sanoid hooks are
 preserved through explicit `["/bin/sh", "-c", "command"]` argv and produce a review
-warning. The converter also warns that Sanoid interprets schedule fields in host
-local time while zsnap uses UTC; review those times before enabling the timer.
-Monitoring-only keys are reported and omitted because monitoring is outside
-zsnap's scope. A setting that cannot be represented without changing snapshot
-coverage, such as `skip_children = yes`, stops conversion rather than silently
-emitting a lossy policy.
+warning. Migration writes `timezone = "local"`, so Sanoid's configured civil
+schedule times and local snapshot-name timestamps are retained. Monitoring-only
+keys are reported and omitted because monitoring is outside zsnap's scope. A
+setting that cannot be represented without changing snapshot coverage, such as
+`skip_children = yes`, stops conversion rather than silently emitting a lossy
+policy.
 
 Keep `snapshot_prefix = "autosnap"`. Existing Sanoid snapshots will suppress
 unnecessary duplicate snapshots, but `zsnap` will never prune them because they

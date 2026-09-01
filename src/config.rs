@@ -142,6 +142,7 @@ const fn default_true() -> bool {
 #[serde(default, deny_unknown_fields)]
 pub struct Settings {
     pub snapshot_prefix: String,
+    pub timezone: ScheduleTimezone,
     pub max_parallel_pools: usize,
     pub snapshot_batch_size: usize,
     pub prune_batch_size: usize,
@@ -154,12 +155,36 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             snapshot_prefix: DEFAULT_PREFIX.to_owned(),
+            timezone: ScheduleTimezone::Local,
             max_parallel_pools: 0,
             snapshot_batch_size: 128,
             prune_batch_size: 64,
             lock_file: PathBuf::from(DEFAULT_LOCK_FILE),
             zfs_command: PathBuf::from("zfs"),
             zpool_command: PathBuf::from("zpool"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ScheduleTimezone {
+    #[default]
+    Local,
+    Utc,
+}
+
+impl<'de> Deserialize<'de> for ScheduleTimezone {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        match value.trim().to_ascii_lowercase().as_str() {
+            "local" | "host" => Ok(Self::Local),
+            "utc" => Ok(Self::Utc),
+            _ => Err(serde::de::Error::custom(format!(
+                "invalid timezone {value:?}; use \"local\" or \"utc\""
+            ))),
         }
     }
 }
@@ -820,6 +845,23 @@ prune_batch_size = 129
                 .to_string();
             assert!(error.contains(message), "{error}");
         }
+    }
+
+    #[test]
+    fn defaults_to_host_timezone_and_accepts_explicit_utc() {
+        let local: Config = toml::from_str(&config_with_notifications("")).unwrap();
+        local.validate().unwrap();
+        assert_eq!(local.settings.timezone, ScheduleTimezone::Local);
+
+        for value in ["utc", "UTC"] {
+            let raw = config_with_notifications(&format!("[settings]\ntimezone = {value:?}\n"));
+            let config: Config = toml::from_str(&raw).unwrap();
+            config.validate().unwrap();
+            assert_eq!(config.settings.timezone, ScheduleTimezone::Utc);
+        }
+
+        let invalid = config_with_notifications("[settings]\ntimezone = \"America/New_York\"\n");
+        assert!(toml::from_str::<Config>(&invalid).is_err());
     }
 
     #[test]

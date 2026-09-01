@@ -6,7 +6,6 @@ ConditionPathExists=/etc/zsnap/zsnap.toml
 
 [Service]
 Type=oneshot
-Environment=TZ=UTC
 EnvironmentFile=-/etc/zsnap/webhooks.env
 RuntimeDirectory=zsnap
 RuntimeDirectoryMode=0750

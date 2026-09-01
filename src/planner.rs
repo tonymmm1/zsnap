@@ -2,11 +2,12 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use anyhow::{Context, Result, bail};
 use chrono::{
-    DateTime, Datelike, Duration, NaiveDate, NaiveDateTime, TimeZone, Timelike, Utc, Weekday,
+    DateTime, Datelike, Duration, Local, LocalResult, NaiveDate, NaiveDateTime, TimeZone, Timelike,
+    Utc, Weekday,
 };
 use serde::Serialize;
 
-use crate::config::{Config, Policy, Recursion};
+use crate::config::{Config, Policy, Recursion, ScheduleTimezone};
 use crate::model::{SnapshotKind, SnapshotStrategy};
 use crate::zfs::{Inventory, Snapshot};
 
@@ -144,7 +145,7 @@ pub fn build_plan(
             .push(snapshot);
     }
 
-    let timestamp = now.format("%Y-%m-%d_%H:%M:%S").to_string();
+    let timestamp = snapshot_timestamp(config.settings.timezone, now);
     let mut plan = Plan::default();
     for dataset in datasets {
         let snapshots = by_dataset
@@ -171,7 +172,7 @@ pub fn build_plan(
                     })
                     .map(|snapshot| snapshot.created)
                     .max();
-                if snapshot_due(kind, &dataset.policy, newest, now)? {
+                if snapshot_due(kind, &dataset.policy, newest, now, config.settings.timezone)? {
                     kinds.push(kind);
                     names.push(format!(
                         "{}_{}_{}",
@@ -251,6 +252,27 @@ pub fn build_plan(
     Ok(plan)
 }
 
+fn snapshot_timestamp(timezone: ScheduleTimezone, now: DateTime<Utc>) -> String {
+    match timezone {
+        ScheduleTimezone::Local => snapshot_timestamp_in(&Local, now),
+        ScheduleTimezone::Utc => snapshot_timestamp_in(&Utc, now),
+    }
+}
+
+fn snapshot_timestamp_in<Tz: TimeZone>(timezone: &Tz, now: DateTime<Utc>) -> String {
+    let local = now.with_timezone(timezone);
+    let naive = local.naive_local();
+    let mut timestamp = naive.format("%Y-%m-%d_%H:%M:%S").to_string();
+    if matches!(
+        map_local_to_utc(timezone, naive),
+        LocalResult::Ambiguous(_, second) if second.timestamp() == now.timestamp()
+    ) {
+        // Match Sanoid's collision suffix during the repeated daylight-saving hour.
+        timestamp.push_str("dst");
+    }
+    timestamp
+}
+
 pub fn snapshot_kind(prefix: &str, name: &str) -> Option<SnapshotKind> {
     if !name.chars().all(|character| {
         character.is_ascii_alphanumeric() || matches!(character, '.' | '-' | '_' | ':')
@@ -281,8 +303,9 @@ fn snapshot_due(
     policy: &Policy,
     newest: Option<i64>,
     now: DateTime<Utc>,
+    timezone: ScheduleTimezone,
 ) -> Result<bool> {
-    let preferred = most_recent_preferred(kind, policy, now)?;
+    let preferred = most_recent_preferred(kind, policy, now, timezone)?;
     Ok(newest.is_none_or(|created| created < preferred.timestamp()))
 }
 
@@ -290,73 +313,164 @@ fn most_recent_preferred(
     kind: SnapshotKind,
     policy: &Policy,
     now: DateTime<Utc>,
+    timezone: ScheduleTimezone,
 ) -> Result<DateTime<Utc>> {
-    let candidate = match kind {
+    match timezone {
+        ScheduleTimezone::Local => most_recent_preferred_in(kind, policy, now, &Local),
+        ScheduleTimezone::Utc => most_recent_preferred_in(kind, policy, now, &Utc),
+    }
+}
+
+fn most_recent_preferred_in<Tz: TimeZone>(
+    kind: SnapshotKind,
+    policy: &Policy,
+    now: DateTime<Utc>,
+    timezone: &Tz,
+) -> Result<DateTime<Utc>> {
+    let civil_now = now.with_timezone(timezone).naive_local();
+    let mut candidate = match kind {
         SnapshotKind::Frequently => {
-            let period = policy.frequent_period as i64 * 60;
-            Utc.timestamp_opt(now.timestamp().div_euclid(period) * period, 0)
-                .single()
-                .context("frequent schedule timestamp is outside the supported range")?
+            let minute = civil_now.minute() / policy.frequent_period * policy.frequent_period;
+            naive_datetime(civil_now.date(), civil_now.hour(), minute)?
         }
         SnapshotKind::Hourly => {
-            let date = now.date_naive();
-            let mut candidate = utc_datetime(date, now.hour(), policy.hourly_min)?;
-            if candidate > now {
-                candidate -= Duration::hours(1);
-            }
-            candidate
+            naive_datetime(civil_now.date(), civil_now.hour(), policy.hourly_min)?
         }
         SnapshotKind::Daily => {
-            let mut candidate =
-                utc_datetime(now.date_naive(), policy.daily_hour, policy.daily_min)?;
-            if candidate > now {
-                candidate -= Duration::days(1);
-            }
-            candidate
+            naive_datetime(civil_now.date(), policy.daily_hour, policy.daily_min)?
         }
         SnapshotKind::Weekly => {
             let wanted = weekday_from_iso(policy.weekly_wday)?;
-            let current = now.weekday().num_days_from_monday() as i64;
+            let current = civil_now.weekday().num_days_from_monday() as i64;
             let target = wanted.num_days_from_monday() as i64;
             let days_back = (current - target).rem_euclid(7);
-            let date = now.date_naive() - Duration::days(days_back);
-            let mut candidate = utc_datetime(date, policy.weekly_hour, policy.weekly_min)?;
-            if candidate > now {
-                candidate -= Duration::weeks(1);
-            }
-            candidate
+            let date = civil_now.date() - Duration::days(days_back);
+            naive_datetime(date, policy.weekly_hour, policy.weekly_min)?
         }
         SnapshotKind::Monthly => {
-            let date = NaiveDate::from_ymd_opt(now.year(), now.month(), policy.monthly_mday)
-                .context("invalid monthly schedule date")?;
-            let mut candidate = utc_datetime(date, policy.monthly_hour, policy.monthly_min)?;
-            if candidate > now {
-                let (year, month) = previous_month(now.year(), now.month());
-                let date = NaiveDate::from_ymd_opt(year, month, policy.monthly_mday)
-                    .context("invalid previous monthly schedule date")?;
-                candidate = utc_datetime(date, policy.monthly_hour, policy.monthly_min)?;
-            }
-            candidate
+            let date =
+                NaiveDate::from_ymd_opt(civil_now.year(), civil_now.month(), policy.monthly_mday)
+                    .context("invalid monthly schedule date")?;
+            naive_datetime(date, policy.monthly_hour, policy.monthly_min)?
         }
         SnapshotKind::Yearly => {
-            let date = valid_yearly_date(now.year(), policy.yearly_mon, policy.yearly_mday)?;
-            let mut candidate = utc_datetime(date, policy.yearly_hour, policy.yearly_min)?;
-            if candidate > now {
-                let date =
-                    valid_yearly_date(now.year() - 1, policy.yearly_mon, policy.yearly_mday)?;
-                candidate = utc_datetime(date, policy.yearly_hour, policy.yearly_min)?;
-            }
-            candidate
+            let date = valid_yearly_date(civil_now.year(), policy.yearly_mon, policy.yearly_mday)?;
+            naive_datetime(date, policy.yearly_hour, policy.yearly_min)?
         }
     };
-    Ok(candidate)
+
+    for _ in 0..4 {
+        if let Some(preferred) = resolve_boundary(timezone, candidate, now)? {
+            return Ok(preferred);
+        }
+        candidate = previous_preferred(kind, candidate, policy)?;
+    }
+    bail!("could not resolve a recent preferred {kind} boundary in the configured timezone")
 }
 
-fn utc_datetime(date: NaiveDate, hour: u32, minute: u32) -> Result<DateTime<Utc>> {
-    let naive = date
-        .and_hms_opt(hour, minute, 0)
-        .context("invalid schedule time")?;
-    Ok(Utc.from_utc_datetime(&naive))
+fn previous_preferred(
+    kind: SnapshotKind,
+    candidate: NaiveDateTime,
+    policy: &Policy,
+) -> Result<NaiveDateTime> {
+    match kind {
+        SnapshotKind::Frequently => {
+            Ok(candidate - Duration::minutes(policy.frequent_period.into()))
+        }
+        SnapshotKind::Hourly => Ok(candidate - Duration::hours(1)),
+        SnapshotKind::Daily => Ok(candidate - Duration::days(1)),
+        SnapshotKind::Weekly => Ok(candidate - Duration::weeks(1)),
+        SnapshotKind::Monthly => {
+            let (year, month) = previous_month(candidate.year(), candidate.month());
+            let date = NaiveDate::from_ymd_opt(year, month, policy.monthly_mday)
+                .context("invalid previous monthly schedule date")?;
+            naive_datetime(date, policy.monthly_hour, policy.monthly_min)
+        }
+        SnapshotKind::Yearly => {
+            let date =
+                valid_yearly_date(candidate.year() - 1, policy.yearly_mon, policy.yearly_mday)?;
+            naive_datetime(date, policy.yearly_hour, policy.yearly_min)
+        }
+    }
+}
+
+fn naive_datetime(date: NaiveDate, hour: u32, minute: u32) -> Result<NaiveDateTime> {
+    date.and_hms_opt(hour, minute, 0)
+        .context("invalid schedule time")
+}
+
+fn resolve_boundary<Tz: TimeZone>(
+    timezone: &Tz,
+    candidate: NaiveDateTime,
+    now: DateTime<Utc>,
+) -> Result<Option<DateTime<Utc>>> {
+    let mut mapped = map_local_to_utc(timezone, candidate);
+    if matches!(mapped, LocalResult::None) {
+        let normalized = normalize_nonexistent_time(timezone, candidate)?;
+        mapped = map_local_to_utc(timezone, normalized);
+    }
+    Ok(latest_not_after(mapped, now))
+}
+
+fn map_local_to_utc<Tz: TimeZone>(
+    timezone: &Tz,
+    candidate: NaiveDateTime,
+) -> LocalResult<DateTime<Utc>> {
+    match timezone.from_local_datetime(&candidate) {
+        LocalResult::Single(value) => LocalResult::Single(value.with_timezone(&Utc)),
+        LocalResult::Ambiguous(first, second) => {
+            LocalResult::Ambiguous(first.with_timezone(&Utc), second.with_timezone(&Utc))
+        }
+        LocalResult::None => LocalResult::None,
+    }
+}
+
+fn latest_not_after(
+    mapped: LocalResult<DateTime<Utc>>,
+    now: DateTime<Utc>,
+) -> Option<DateTime<Utc>> {
+    match mapped {
+        LocalResult::Single(value) => (value <= now).then_some(value),
+        LocalResult::Ambiguous(first, second) => [first, second]
+            .into_iter()
+            .filter(|value| *value <= now)
+            .max(),
+        LocalResult::None => None,
+    }
+}
+
+fn normalize_nonexistent_time<Tz: TimeZone>(
+    timezone: &Tz,
+    candidate: NaiveDateTime,
+) -> Result<NaiveDateTime> {
+    let mut before = None;
+    let mut after = None;
+    for minutes in 1..=180 {
+        let distance = Duration::minutes(minutes);
+        if before.is_none() {
+            let value = candidate - distance;
+            if !matches!(map_local_to_utc(timezone, value), LocalResult::None) {
+                before = Some(value);
+            }
+        }
+        if after.is_none() {
+            let value = candidate + distance;
+            if !matches!(map_local_to_utc(timezone, value), LocalResult::None) {
+                after = Some(value);
+            }
+        }
+        if before.is_some() && after.is_some() {
+            break;
+        }
+    }
+    let before =
+        before.context("could not find a valid local time before a timezone transition")?;
+    let after = after.context("could not find a valid local time after a timezone transition")?;
+    let gap = after - before - Duration::minutes(1);
+    if gap <= Duration::zero() {
+        bail!("could not determine the local timezone transition gap")
+    }
+    Ok(candidate + gap)
 }
 
 fn weekday_from_iso(day: u32) -> Result<Weekday> {
@@ -396,7 +510,7 @@ fn dataset_depth(name: &str) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use chrono::TimeZone;
+    use chrono::{FixedOffset, TimeZone};
 
     use super::*;
     use crate::config::{DatasetConfig, Notifications, PolicyPatch, Recursion, Settings};
@@ -428,7 +542,10 @@ mod tests {
         );
         Config {
             version: 1,
-            settings: Settings::default(),
+            settings: Settings {
+                timezone: ScheduleTimezone::Utc,
+                ..Settings::default()
+            },
             notifications: Notifications::default(),
             templates,
             datasets,
@@ -484,6 +601,47 @@ mod tests {
         let plan = build_plan(&config, &inventory, &resolved, now).unwrap();
         assert_eq!(plan.snapshot_count(), 1); // Child is missing an hourly; parent is current.
         assert_eq!(plan.snapshots[0].dataset, "tank/data/db");
+        assert_eq!(
+            plan.snapshots[0].names[0],
+            "autosnap_2026-08-27_12:10:00_hourly"
+        );
+    }
+
+    #[test]
+    fn civil_schedule_and_names_follow_the_selected_offset() {
+        let timezone = FixedOffset::west_opt(4 * 60 * 60).unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 8, 27, 12, 10, 0).unwrap();
+        let policy = Policy {
+            hourly_min: 5,
+            ..Policy::default()
+        };
+        let preferred =
+            most_recent_preferred_in(SnapshotKind::Hourly, &policy, now, &timezone).unwrap();
+        assert_eq!(
+            preferred,
+            Utc.with_ymd_and_hms(2026, 8, 27, 12, 5, 0).unwrap()
+        );
+        assert_eq!(snapshot_timestamp_in(&timezone, now), "2026-08-27_08:10:00");
+    }
+
+    #[test]
+    fn ambiguous_boundaries_select_the_latest_occurrence_not_after_now() {
+        let first = Utc.with_ymd_and_hms(2026, 11, 1, 5, 30, 0).unwrap();
+        let second = Utc.with_ymd_and_hms(2026, 11, 1, 6, 30, 0).unwrap();
+        assert_eq!(
+            latest_not_after(
+                LocalResult::Ambiguous(first, second),
+                Utc.with_ymd_and_hms(2026, 11, 1, 5, 45, 0).unwrap(),
+            ),
+            Some(first)
+        );
+        assert_eq!(
+            latest_not_after(
+                LocalResult::Ambiguous(first, second),
+                Utc.with_ymd_and_hms(2026, 11, 1, 6, 45, 0).unwrap(),
+            ),
+            Some(second)
+        );
     }
 
     #[test]

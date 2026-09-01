@@ -306,6 +306,7 @@ yearly = 0
     );
     let generated = fs::read_to_string(&output).unwrap();
     assert!(generated.contains("Existing unmarked Sanoid snapshots are never pruned"));
+    assert!(generated.contains("timezone = \"local\""));
 
     let check = Command::new(env!("CARGO_BIN_EXE_zsnap"))
         .args(["--config", output.to_str().unwrap(), "check"])

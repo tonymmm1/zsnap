@@ -1,9 +1,13 @@
-# zsnap configuration format. All timestamps and schedules use UTC.
+# zsnap configuration format.
 version = 1
 
 [settings]
 # Sanoid-compatible names: autosnap_YYYY-MM-DD_HH:MM:SS_<period>
 snapshot_prefix = "autosnap"
+
+# Use the host's local timezone for schedules and snapshot names by default.
+# Set this to "utc" for UTC civil schedules and names.
+timezone = "local"
 
 # Recommended for a normal host with a handful of pools: leave this at 0, which
 # means one worker for every pool represented by the plan. On a host with many
@@ -77,7 +81,8 @@ weekly = 4
 monthly = 3
 yearly = 0
 
-# Preferred UTC schedule. weekly_wday is ISO: Monday=1, Sunday=7.
+# Preferred schedule in the selected timezone. weekly_wday is ISO:
+# Monday=1, Sunday=7.
 frequent_period = 15
 hourly_min = 0
 daily_hour = 23
