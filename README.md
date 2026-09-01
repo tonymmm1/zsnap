@@ -112,6 +112,9 @@ New snapshots receive the ZFS user property `org.zsnap:managed=yes`. By default,
 `zsnap` only deletes snapshots carrying that property. Existing Sanoid-compatible
 snapshots still count as recent snapshots when scheduling, preventing duplicates,
 but they are never deleted by `zsnap` because they lack its ownership marker.
+Managed snapshots with ZFS user holds (including Syncoid holds) or dependent clones
+are excluded from pruning and reported as protected; zsnap never uses deferred
+destroy to work around those protections.
 
 Every generated `zfs destroy` command is checked again at the execution boundary.
 Only strict `dataset@snapshot[,snapshot...]` targets without flags are permitted;

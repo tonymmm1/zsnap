@@ -219,7 +219,7 @@ fn status_refreshes_atomically_then_reads_without_querying_zfs() {
         r#"#!/bin/sh
 case "$*" in
   *filesystem,volume*) printf 'tank\ntank/data\ntank/data/vm\n' ;;
-  *snapshot*) printf 'tank/data@autosnap_hourly\t100\tyes\ntank/data@manual\t90\t-\n' ;;
+  *snapshot*) printf 'tank/data@autosnap_hourly\t100\tyes\t0\t-\ntank/data@manual\t90\t-\t0\t-\n' ;;
   *) exit 64 ;;
 esac
 "#,

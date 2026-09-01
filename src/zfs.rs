@@ -15,6 +15,14 @@ pub struct Snapshot {
     pub name: String,
     pub created: i64,
     pub managed: bool,
+    pub user_holds: u64,
+    pub has_clones: bool,
+}
+
+impl Snapshot {
+    pub const fn prune_protected(&self) -> bool {
+        self.user_holds > 0 || self.has_clones
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -62,7 +70,7 @@ impl Inventory {
             "-t".into(),
             "snapshot".into(),
             "-o".into(),
-            format!("name,creation,{MANAGED_PROPERTY}").into(),
+            format!("name,creation,{MANAGED_PROPERTY},userrefs,clones").into(),
         ];
         snapshot_args.extend(configured_datasets.into_iter().map(OsString::from));
         let snapshots_output = run_checked(&settings.zfs_command, &snapshot_args)?;
@@ -186,9 +194,9 @@ pub fn parse_snapshots(output: &str) -> Result<Vec<Snapshot>> {
             continue;
         }
         let fields: Vec<_> = line.split('\t').collect();
-        if fields.len() != 3 {
+        if fields.len() != 5 {
             bail!(
-                "invalid snapshot listing on line {}: expected 3 tab-separated fields, got {}",
+                "invalid snapshot listing on line {}: expected 5 tab-separated fields, got {}",
                 index + 1,
                 fields.len()
             );
@@ -211,6 +219,14 @@ pub fn parse_snapshots(output: &str) -> Result<Vec<Snapshot>> {
             fields[2].trim().to_ascii_lowercase().as_str(),
             "1" | "yes" | "true" | "on"
         );
+        let user_holds = fields[3].parse::<u64>().with_context(|| {
+            format!(
+                "invalid snapshot userrefs count {:?} on line {}",
+                fields[3],
+                index + 1
+            )
+        })?;
+        let has_clones = !matches!(fields[4].trim(), "" | "-");
         snapshots.insert(
             fields[0].to_owned(),
             Snapshot {
@@ -218,6 +234,8 @@ pub fn parse_snapshots(output: &str) -> Result<Vec<Snapshot>> {
                 name: name.to_owned(),
                 created,
                 managed,
+                user_holds,
+                has_clones,
             },
         );
     }
@@ -273,13 +291,17 @@ mod tests {
         assert!(datasets.contains("tank/data"));
 
         let snapshots = parse_snapshots(
-            "tank/data@autosnap_2026-08-27_12:00:00_hourly\t1787832000\tyes\n\
-             tank/data@manual\t1787831000\t-\n",
+            "tank/data@autosnap_2026-08-27_12:00:00_hourly\t1787832000\tyes\t1\ttank/clone-a,tank/clone-b\n\
+             tank/data@manual\t1787831000\t-\t0\t-\n",
         )
         .unwrap();
         assert_eq!(snapshots.len(), 2);
         assert!(snapshots[0].managed);
+        assert_eq!(snapshots[0].user_holds, 1);
+        assert!(snapshots[0].has_clones);
+        assert!(snapshots[0].prune_protected());
         assert!(!snapshots[1].managed);
+        assert!(!snapshots[1].prune_protected());
 
         let pools = parse_pools("tank\t42%\nbackup\t7%\n").unwrap();
         assert_eq!(pools["tank"].capacity_percent, 42);

@@ -39,11 +39,21 @@ pub struct PruneAction {
     pub policy: Policy,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct ProtectedSnapshot {
+    pub pool: String,
+    pub dataset: String,
+    pub name: String,
+    pub user_holds: u64,
+    pub has_clones: bool,
+}
+
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct Plan {
     pub snapshots: Vec<SnapshotAction>,
     pub prunes: Vec<PruneAction>,
     pub deferred_prune_datasets: Vec<String>,
+    pub protected_snapshots: Vec<ProtectedSnapshot>,
 }
 
 impl Plan {
@@ -52,6 +62,11 @@ impl Plan {
             .iter()
             .map(|action| action.pool.as_str())
             .chain(self.prunes.iter().map(|action| action.pool.as_str()))
+            .chain(
+                self.protected_snapshots
+                    .iter()
+                    .map(|snapshot| snapshot.pool.as_str()),
+            )
             .collect()
     }
 
@@ -63,9 +78,14 @@ impl Plan {
         self.prunes.iter().map(|action| action.names.len()).sum()
     }
 
+    pub fn protected_snapshot_count(&self) -> usize {
+        self.protected_snapshots.len()
+    }
+
     pub fn retain_snapshots_only(&mut self) {
         self.prunes.clear();
         self.deferred_prune_datasets.clear();
+        self.protected_snapshots.clear();
     }
 
     pub fn retain_prunes_only(&mut self) {
@@ -215,11 +235,25 @@ pub fn build_plan(
         let mut names = Vec::new();
         for kind in SnapshotKind::ALL {
             let keep = dataset.policy.retention(kind) as usize;
+            for snapshot in snapshots.iter().filter(|snapshot| {
+                snapshot_kind(&config.settings.snapshot_prefix, &snapshot.name) == Some(kind)
+                    && snapshot.managed
+                    && snapshot.prune_protected()
+            }) {
+                plan.protected_snapshots.push(ProtectedSnapshot {
+                    pool: dataset.pool.clone(),
+                    dataset: dataset.name.clone(),
+                    name: snapshot.name.clone(),
+                    user_holds: snapshot.user_holds,
+                    has_clones: snapshot.has_clones,
+                });
+            }
             let mut matching: Vec<_> = snapshots
                 .iter()
                 .filter(|snapshot| {
                     snapshot_kind(&config.settings.snapshot_prefix, &snapshot.name) == Some(kind)
                         && snapshot.managed
+                        && !snapshot.prune_protected()
                 })
                 .copied()
                 .collect();
@@ -249,6 +283,9 @@ pub fn build_plan(
     plan.prunes
         .sort_by(|a, b| (&a.pool, &a.dataset).cmp(&(&b.pool, &b.dataset)));
     plan.deferred_prune_datasets.sort();
+    plan.protected_snapshots.sort_by(|left, right| {
+        (&left.pool, &left.dataset, &left.name).cmp(&(&right.pool, &right.dataset, &right.name))
+    });
     Ok(plan)
 }
 
@@ -596,6 +633,8 @@ mod tests {
                 .unwrap()
                 .timestamp(),
             managed: true,
+            user_holds: 0,
+            has_clones: false,
         });
         let resolved = resolve_datasets(&config, &inventory).unwrap();
         let plan = build_plan(&config, &inventory, &resolved, now).unwrap();
@@ -655,6 +694,8 @@ mod tests {
                 name: format!("autosnap_2026-08-27_{hour:02}:00:00_hourly"),
                 created: (now - Duration::hours(hours_ago)).timestamp(),
                 managed: true,
+                user_holds: 0,
+                has_clones: false,
             });
         }
         let resolved = resolve_datasets(&config, &inventory).unwrap();
@@ -673,11 +714,58 @@ mod tests {
                 name: format!("autosnap_2026-08-27_{hour:02}:00:00_hourly"),
                 created: (now - Duration::hours(hours_ago)).timestamp(),
                 managed: false,
+                user_holds: 0,
+                has_clones: false,
             });
         }
         let resolved = resolve_datasets(&config, &inventory).unwrap();
         let plan = build_plan(&config, &inventory, &resolved, now).unwrap();
         assert_eq!(plan.prune_count(), 0);
+    }
+
+    #[test]
+    fn held_and_cloned_snapshots_are_never_pruned() {
+        let config = test_config();
+        let mut inventory = test_inventory();
+        let now = Utc.with_ymd_and_hms(2026, 8, 27, 12, 10, 0).unwrap();
+        for (hours_ago, hour) in [(8, 4), (7, 5), (1, 11)] {
+            inventory.snapshots.push(Snapshot {
+                dataset: "tank/data".to_owned(),
+                name: format!("autosnap_2026-08-27_{hour:02}:00:00_hourly"),
+                created: (now - Duration::hours(hours_ago)).timestamp(),
+                managed: true,
+                user_holds: 0,
+                has_clones: false,
+            });
+        }
+        inventory.snapshots.push(Snapshot {
+            dataset: "tank/data".to_owned(),
+            name: "autosnap_2026-08-27_02:00:00_hourly".to_owned(),
+            created: (now - Duration::hours(10)).timestamp(),
+            managed: true,
+            user_holds: 1,
+            has_clones: false,
+        });
+        inventory.snapshots.push(Snapshot {
+            dataset: "tank/data".to_owned(),
+            name: "autosnap_2026-08-27_03:00:00_hourly".to_owned(),
+            created: (now - Duration::hours(9)).timestamp(),
+            managed: true,
+            user_holds: 0,
+            has_clones: true,
+        });
+
+        let resolved = resolve_datasets(&config, &inventory).unwrap();
+        let plan = build_plan(&config, &inventory, &resolved, now).unwrap();
+
+        assert_eq!(plan.prune_count(), 1);
+        assert_eq!(plan.protected_snapshot_count(), 2);
+        assert_eq!(
+            plan.prunes[0].names,
+            ["autosnap_2026-08-27_04:00:00_hourly"]
+        );
+        assert!(plan.protected_snapshots[0].user_holds > 0);
+        assert!(plan.protected_snapshots[1].has_clones);
     }
 
     #[test]

@@ -116,6 +116,7 @@ struct CheckOutput {
 struct RunSummary {
     snapshots_created: usize,
     snapshots_pruned: usize,
+    snapshots_protected: usize,
     pools: usize,
 }
 
@@ -158,8 +159,11 @@ fn main() -> Result<()> {
             Ok(summary) => (
                 DeliveryEvent::Success,
                 format!(
-                    "Created {} snapshot(s), pruned {} snapshot(s), {} pool(s).",
-                    summary.snapshots_created, summary.snapshots_pruned, summary.pools
+                    "Created {} snapshot(s), pruned {} snapshot(s), protected {} snapshot(s), {} pool(s).",
+                    summary.snapshots_created,
+                    summary.snapshots_pruned,
+                    summary.snapshots_protected,
+                    summary.pools
                 ),
             ),
             Err(error) => (DeliveryEvent::Failure, format!("Error: {error:#}")),
@@ -238,6 +242,7 @@ fn run_zfs_command(cli: &Cli, config: &Config) -> Result<RunSummary> {
         return Ok(RunSummary {
             snapshots_created: 0,
             snapshots_pruned: 0,
+            snapshots_protected: plan.protected_snapshot_count(),
             pools: plan.pools().len(),
         });
     }
@@ -282,6 +287,7 @@ fn run_zfs_command(cli: &Cli, config: &Config) -> Result<RunSummary> {
     Ok(RunSummary {
         snapshots_created: report.snapshots_created,
         snapshots_pruned: report.snapshots_pruned,
+        snapshots_protected: plan.protected_snapshot_count(),
         pools: plan.pools().len(),
     })
 }
@@ -578,9 +584,10 @@ fn print_plan(plan: &Plan, json: bool) -> Result<()> {
         return Ok(());
     }
     println!(
-        "plan: create {} snapshot(s), prune {} snapshot(s), {} pool(s)",
+        "plan: create {} snapshot(s), prune {} snapshot(s), protect {} snapshot(s), {} pool(s)",
         plan.snapshot_count(),
         plan.prune_count(),
+        plan.protected_snapshot_count(),
         plan.pools().len()
     );
     for action in &plan.snapshots {
@@ -604,6 +611,21 @@ fn print_plan(plan: &Plan, json: bool) -> Result<()> {
     for dataset in &plan.deferred_prune_datasets {
         println!("  DEFER  pruning {dataset}: pool capacity is below prune_defer");
     }
+    for snapshot in &plan.protected_snapshots {
+        let reason = match (snapshot.user_holds > 0, snapshot.has_clones) {
+            (true, true) => format!(
+                "{} user hold(s) and one or more dependent clones",
+                snapshot.user_holds
+            ),
+            (true, false) => format!("{} user hold(s)", snapshot.user_holds),
+            (false, true) => "one or more dependent clones".to_owned(),
+            (false, false) => unreachable!(),
+        };
+        println!(
+            "  PROTECT [{}] {}@{}: {reason}",
+            snapshot.pool, snapshot.dataset, snapshot.name
+        );
+    }
     Ok(())
 }
 
@@ -619,6 +641,20 @@ fn print_report(plan: &Plan, report: &ExecutionReport, json: bool, verbose: bool
     }
     for error in &report.errors {
         eprintln!("ERROR: {error}");
+    }
+    if !plan.protected_snapshots.is_empty() {
+        println!(
+            "protected {} managed snapshot(s) from pruning because of user holds or dependent clones",
+            plan.protected_snapshot_count()
+        );
+        if verbose || report.dry_run {
+            for snapshot in &plan.protected_snapshots {
+                println!(
+                    "  PROTECT [{}] {}@{}",
+                    snapshot.pool, snapshot.dataset, snapshot.name
+                );
+            }
+        }
     }
     if report.dry_run {
         println!(

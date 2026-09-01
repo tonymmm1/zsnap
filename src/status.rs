@@ -439,6 +439,8 @@ mod tests {
             name: name.to_owned(),
             created: 0,
             managed,
+            user_holds: 0,
+            has_clones: false,
         }
     }
 
