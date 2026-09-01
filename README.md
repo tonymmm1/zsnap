@@ -431,9 +431,12 @@ in the environment file:
 ZSNAP_FLOCK_WEBHOOK='https://api.flock.com/hooks/sendMessage/REPLACE'
 ```
 
-The systemd unit reads it as an optional `EnvironmentFile`; the OpenRC and Alpine
-periodic runners source it as a root-owned shell environment file. Webhook URLs
-must use HTTPS. Errors and debug representations redact configured URLs.
+zsnap automatically reads `webhooks.env` next to the selected TOML configuration,
+so direct commands and scheduled runs resolve the same secrets. Values already in
+the process environment take precedence, allowing one-off overrides. The systemd
+unit and OpenRC/Alpine runners also supply the installed file for compatibility.
+Webhook URLs must use HTTPS. Errors and debug representations redact configured
+URLs.
 
 Test every enabled endpoint through the real delivery path without touching ZFS:
 

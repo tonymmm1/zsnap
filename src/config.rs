@@ -911,7 +911,7 @@ pub(crate) fn validate_webhook_url(url: &str, context: &str) -> Result<()> {
     Ok(())
 }
 
-fn is_portable_environment_name(name: &str) -> bool {
+pub(crate) fn is_portable_environment_name(name: &str) -> bool {
     let mut characters = name.chars();
     matches!(characters.next(), Some('_' | 'A'..='Z' | 'a'..='z'))
         && characters.all(|character| matches!(character, '_' | 'A'..='Z' | 'a'..='z' | '0'..='9'))

@@ -138,11 +138,12 @@ fn main() -> Result<()> {
     }
 
     let config = Config::load(&cli.config)?;
+    let webhook_environment_file = notification::environment_file_for_config(&cli.config);
     if let Commands::Check { probe } = &cli.command {
         return check(&config, *probe, cli.json);
     }
     if let Commands::NotifyTest { message } = &cli.command {
-        return notify_test(&config, message, cli.json);
+        return notify_test(&config, message, cli.json, &webhook_environment_file);
     }
     if let Commands::Status { refresh } = &cli.command {
         return show_status(&config, *refresh, cli.json, cli.verbose);
@@ -173,7 +174,12 @@ fn main() -> Result<()> {
             notification::hostname(&config.notifications),
             started.elapsed().as_secs_f64(),
         );
-        match notification::deliver(&config.notifications, event, &message) {
+        match notification::deliver_with_environment_file(
+            &config.notifications,
+            event,
+            &message,
+            &webhook_environment_file,
+        ) {
             Ok(report) => {
                 print_notification_errors(&report);
                 if !report.succeeded() {
@@ -399,13 +405,18 @@ fn format_cache_age(generated_at: chrono::DateTime<Utc>) -> String {
     }
 }
 
-fn notify_test(config: &Config, text: &str, json: bool) -> Result<()> {
+fn notify_test(config: &Config, text: &str, json: bool, environment_file: &Path) -> Result<()> {
     let message = format!(
         "zsnap TEST on {}\n{}",
         notification::hostname(&config.notifications),
         text
     );
-    let report = notification::deliver(&config.notifications, DeliveryEvent::Test, &message)?;
+    let report = notification::deliver_with_environment_file(
+        &config.notifications,
+        DeliveryEvent::Test,
+        &message,
+        environment_file,
+    )?;
     if json {
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else {

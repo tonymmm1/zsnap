@@ -362,6 +362,43 @@ fn notify_test_requires_an_enabled_target() {
 }
 
 #[test]
+fn notify_test_loads_the_environment_file_next_to_the_config() {
+    let directory = tempdir().unwrap();
+    let config = directory.path().join("zsnap.toml");
+    let environment = directory.path().join("webhooks.env");
+    fs::write(
+        &config,
+        r#"version = 1
+
+[notifications]
+max_attempts = 1
+
+[[notifications.webhooks]]
+name = "storage-discord"
+kind = "discord"
+url_env = "ZSNAP_CLI_TEST_DISCORD_7D5ED06D"
+
+[tank]
+"#,
+    )
+    .unwrap();
+    fs::write(
+        environment,
+        "ZSNAP_CLI_TEST_DISCORD_7D5ED06D='discord://loaded-from-file'\n",
+    )
+    .unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_zsnap"))
+        .args(["--config", config.to_str().unwrap(), "notify-test"])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success());
+    assert!(stderr.contains("webhook URL must use HTTPS"), "{stderr}");
+    assert!(!stderr.contains("environment variable ZSNAP_CLI_TEST_DISCORD_7D5ED06D is not set"));
+}
+
+#[test]
 fn failed_zfs_run_attempts_a_failure_notification_and_stays_failed() {
     let directory = tempdir().unwrap();
     let zfs = directory.path().join("zfs");

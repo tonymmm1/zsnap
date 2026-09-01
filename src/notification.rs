@@ -1,19 +1,26 @@
 use std::borrow::Cow;
+use std::collections::BTreeMap;
 use std::env;
 use std::fs;
+use std::io::ErrorKind;
+use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use rayon::prelude::*;
 use serde::Serialize;
 
 use crate::config::{
-    Notifications, WebhookConfig, WebhookEvent, WebhookKind, validate_webhook_url,
+    Notifications, WebhookConfig, WebhookEvent, WebhookKind, is_portable_environment_name,
+    validate_webhook_url,
 };
 
 const MAX_MESSAGE_CHARACTERS: usize = 1_900;
 const MAX_RETRY_DELAY_MILLISECONDS: u64 = 30_000;
+const WEBHOOK_ENVIRONMENT_FILE: &str = "webhooks.env";
+
+type WebhookEnvironment = BTreeMap<String, String>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeliveryEvent {
@@ -75,7 +82,42 @@ pub fn deliver(
     event: DeliveryEvent,
     message: &str,
 ) -> Result<NotificationReport> {
-    deliver_with_policy(config, event, message, TransportPolicy::HttpsOnly)
+    deliver_with_policy(
+        config,
+        event,
+        message,
+        TransportPolicy::HttpsOnly,
+        &WebhookEnvironment::new(),
+    )
+}
+
+/// Return the conventional webhook environment file next to a zsnap config.
+pub fn environment_file_for_config(config_path: &Path) -> PathBuf {
+    config_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
+        .join(WEBHOOK_ENVIRONMENT_FILE)
+}
+
+/// Deliver notifications with secrets from the process environment or an optional file.
+///
+/// Explicit process environment values take precedence over file values. A missing file is
+/// allowed so configurations that use direct URLs or externally supplied variables keep working.
+pub fn deliver_with_environment_file(
+    config: &Notifications,
+    event: DeliveryEvent,
+    message: &str,
+    environment_file: &Path,
+) -> Result<NotificationReport> {
+    let file_environment = load_environment_file(environment_file)?;
+    deliver_with_policy(
+        config,
+        event,
+        message,
+        TransportPolicy::HttpsOnly,
+        &file_environment,
+    )
 }
 
 fn deliver_with_policy(
@@ -83,6 +125,7 @@ fn deliver_with_policy(
     event: DeliveryEvent,
     message: &str,
     transport_policy: TransportPolicy,
+    file_environment: &WebhookEnvironment,
 ) -> Result<NotificationReport> {
     let selected: Vec<_> = if config.enabled {
         config
@@ -119,7 +162,16 @@ fn deliver_with_policy(
     let mut deliveries = pool.install(|| {
         selected
             .into_par_iter()
-            .map(|webhook| deliver_one(&agent, config, webhook, &message, transport_policy))
+            .map(|webhook| {
+                deliver_one(
+                    &agent,
+                    config,
+                    webhook,
+                    &message,
+                    transport_policy,
+                    file_environment,
+                )
+            })
             .collect::<Vec<_>>()
     });
     deliveries.sort_by(|left, right| left.target.cmp(&right.target));
@@ -166,6 +218,7 @@ fn deliver_one(
     webhook: &WebhookConfig,
     message: &str,
     transport_policy: TransportPolicy,
+    file_environment: &WebhookEnvironment,
 ) -> NotificationDelivery {
     let mut delivery = NotificationDelivery {
         target: webhook.name.clone(),
@@ -173,7 +226,7 @@ fn deliver_one(
         attempts: 0,
         error: None,
     };
-    let url = match resolve_url(webhook, transport_policy) {
+    let url = match resolve_url(webhook, transport_policy, file_environment) {
         Ok(url) => url,
         Err(error) => {
             delivery.error = Some(error);
@@ -223,11 +276,23 @@ fn payload(kind: WebhookKind, message: &str) -> String {
 fn resolve_url(
     webhook: &WebhookConfig,
     transport_policy: TransportPolicy,
+    file_environment: &WebhookEnvironment,
 ) -> std::result::Result<String, String> {
     let url = if let Some(url) = &webhook.url {
         url.expose().to_owned()
     } else if let Some(variable) = &webhook.url_env {
-        env::var(variable).map_err(|_| format!("environment variable {variable} is not set"))?
+        match env::var(variable) {
+            Ok(value) => value,
+            Err(env::VarError::NotPresent) => file_environment
+                .get(variable)
+                .cloned()
+                .ok_or_else(|| format!("environment variable {variable} is not set"))?,
+            Err(env::VarError::NotUnicode(_)) => {
+                return Err(format!(
+                    "environment variable {variable} is not valid UTF-8"
+                ));
+            }
+        }
     } else {
         return Err("no URL source is configured".to_owned());
     };
@@ -240,6 +305,78 @@ fn resolve_url(
         TransportPolicy::TestHttp => {}
     }
     Ok(url)
+}
+
+fn load_environment_file(path: &Path) -> Result<WebhookEnvironment> {
+    let raw = match fs::read_to_string(path) {
+        Ok(raw) => raw,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(WebhookEnvironment::new()),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("failed to read webhook environment {}", path.display()));
+        }
+    };
+    let mut environment = WebhookEnvironment::new();
+    for (index, raw_line) in raw.lines().enumerate() {
+        let line_number = index + 1;
+        let line = raw_line.trim();
+        if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
+            continue;
+        }
+        let Some((raw_name, raw_value)) = line.split_once('=') else {
+            bail!(
+                "invalid webhook environment {} line {}: expected NAME=VALUE",
+                path.display(),
+                line_number
+            );
+        };
+        let name = raw_name.trim();
+        if !is_portable_environment_name(name) {
+            bail!(
+                "invalid webhook environment {} line {}: invalid variable name",
+                path.display(),
+                line_number
+            );
+        }
+        if environment.contains_key(name) {
+            bail!(
+                "invalid webhook environment {} line {}: duplicate variable {name}",
+                path.display(),
+                line_number
+            );
+        }
+        let value = parse_environment_value(raw_value, path, line_number)?;
+        environment.insert(name.to_owned(), value);
+    }
+    Ok(environment)
+}
+
+fn parse_environment_value(raw: &str, path: &Path, line_number: usize) -> Result<String> {
+    let value = raw.trim();
+    let malformed = || {
+        anyhow::anyhow!(
+            "invalid webhook environment {} line {}: use an unquoted value without spaces or one matching pair of quotes",
+            path.display(),
+            line_number
+        )
+    };
+    let Some(first) = value.chars().next() else {
+        return Ok(String::new());
+    };
+    if matches!(first, '\'' | '"') {
+        if value.len() < 2 || !value.ends_with(first) {
+            return Err(malformed());
+        }
+        let inner = &value[first.len_utf8()..value.len() - first.len_utf8()];
+        if inner.contains(first) || inner.contains(['\n', '\r', '\0']) {
+            return Err(malformed());
+        }
+        return Ok(inner.to_owned());
+    }
+    if value.chars().any(char::is_whitespace) || value.contains(['\'', '"', '\0']) {
+        return Err(malformed());
+    }
+    Ok(value.to_owned())
 }
 
 fn is_retryable(error: &ureq::Error) -> bool {
@@ -395,10 +532,59 @@ mod tests {
             DeliveryEvent::Failure,
             "test",
             TransportPolicy::TestHttp,
+            &WebhookEnvironment::new(),
         )
         .unwrap();
         server.join().unwrap();
         assert_eq!(report.delivered, 4);
         assert_eq!(maximum.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn loads_quoted_values_from_the_config_sibling_environment_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let config_path = directory.path().join("zsnap.toml");
+        let environment_path = environment_file_for_config(&config_path);
+        fs::write(
+            &environment_path,
+            "# webhook secrets\nZSNAP_TEST_DISCORD='https://example.invalid/discord'\nZSNAP_TEST_SLACK=https://example.invalid/slack\n",
+        )
+        .unwrap();
+
+        let environment = load_environment_file(&environment_path).unwrap();
+        assert_eq!(
+            environment.get("ZSNAP_TEST_DISCORD").unwrap(),
+            "https://example.invalid/discord"
+        );
+        assert_eq!(
+            environment.get("ZSNAP_TEST_SLACK").unwrap(),
+            "https://example.invalid/slack"
+        );
+    }
+
+    #[test]
+    fn resolves_url_env_from_the_environment_file_fallback() {
+        const VARIABLE: &str = "ZSNAP_UNIT_TEST_FILE_ONLY_7D5ED06D";
+        let mut target = webhook(WebhookKind::Discord);
+        target.url = None;
+        target.url_env = Some(VARIABLE.to_owned());
+        let environment = WebhookEnvironment::from([(
+            VARIABLE.to_owned(),
+            "https://example.invalid/from-file".to_owned(),
+        )]);
+
+        let resolved = resolve_url(&target, TransportPolicy::HttpsOnly, &environment).unwrap();
+        assert_eq!(resolved, "https://example.invalid/from-file");
+    }
+
+    #[test]
+    fn rejects_malformed_environment_files_without_exposing_values() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("webhooks.env");
+        fs::write(&path, "ZSNAP_SECRET='do-not-print\n").unwrap();
+
+        let error = load_environment_file(&path).unwrap_err().to_string();
+        assert!(error.contains("line 1"));
+        assert!(!error.contains("do-not-print"));
     }
 }
