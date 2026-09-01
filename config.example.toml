@@ -1,4 +1,5 @@
-# zsnap configuration format.
+# zsnap configuration format. Dataset headers allow the [pool/dataset] shorthand,
+# and use_templates allows bare simple names; other values use normal TOML syntax.
 version = 1
 
 [settings]
@@ -114,27 +115,18 @@ yearly = 0
 
 # Manage every dataset below tank/data individually. Explicit child sections
 # can override this inherited policy.
-[datasets."tank/data"]
-use_templates = ["production"]
+[tank/data]
+use_templates = [production]
 recursive = true
 
 # This child starts with its inherited policy, reapplies production, then changes
 # only hourly retention.
-[datasets."tank/data/vm"]
-use_templates = ["production"]
-
-[datasets."tank/data/vm".policy]
+[tank/data/vm]
+use_templates = [production]
 hourly = 12
 
-# `recursive = "zfs"` uses `zfs snapshot -r` for atomic tree-wide snapshots.
-# Child policy sections are intentionally rejected under an atomic root.
-[datasets."archive/incoming"]
-use_templates = ["backup"]
-recursive = "zfs"
-
-# Hooks are argv arrays, never implicit shell strings. Put them in a template or
-# dataset policy. Hooked datasets are kept out of command batches.
-# [datasets."tank/data/vm".policy]
+# Hooks are argv arrays, never implicit shell strings. Policy fields live directly
+# in the dataset section, just like the hourly override above.
 # pre_snapshot_script = ["/usr/local/libexec/zsnap/quiesce", "--guest", "vm"]
 # post_snapshot_script = ["/usr/local/libexec/zsnap/resume", "--guest", "vm"]
 # pre_pruning_script = ["/usr/local/libexec/zsnap/before-prune"]
@@ -142,3 +134,9 @@ recursive = "zfs"
 # script_timeout = 10
 # no_inconsistent_snapshot = true
 # force_post_snapshot_script = true
+
+# `recursive = "zfs"` uses `zfs snapshot -r` for atomic tree-wide snapshots.
+# Child policy sections are intentionally rejected under an atomic root.
+[archive/incoming]
+use_templates = [backup]
+recursive = "zfs"

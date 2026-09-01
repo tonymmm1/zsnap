@@ -65,11 +65,11 @@ weekly = 0
 monthly = 0
 yearly = 0
 
-[datasets."tank/data"]
-use_templates = ["test"]
+[tank/data]
+use_templates = [test]
 
-[datasets."backup/data"]
-use_templates = ["test"]
+[backup/data]
+use_templates = [test]
 "#,
             zfs.display(),
             zpool.display(),
@@ -150,7 +150,7 @@ fn notify_test_requires_an_enabled_target() {
     fs::write(
         &config,
         r#"version = 1
-[datasets."tank/data"]
+[tank/data]
 "#,
     )
     .unwrap();
@@ -307,6 +307,9 @@ yearly = 0
     let generated = fs::read_to_string(&output).unwrap();
     assert!(generated.contains("Existing unmarked Sanoid snapshots are never pruned"));
     assert!(generated.contains("timezone = \"local\""));
+    assert!(generated.contains("[tank/data]"));
+    assert!(generated.contains("use_templates = [sanoid_defaults, production]"));
+    assert!(!generated.contains("[datasets.\"tank/data\"]"));
 
     let check = Command::new(env!("CARGO_BIN_EXE_zsnap"))
         .args(["--config", output.to_str().unwrap(), "check"])

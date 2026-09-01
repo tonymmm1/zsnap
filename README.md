@@ -6,10 +6,11 @@
 
 `zsnap` is a policy-driven ZFS snapshot manager written in Rust. It takes the
 useful snapshot lifecycle ideas from [Sanoid](https://github.com/jimsalterjrs/sanoid),
-uses an actual TOML configuration schema, and compiles to one executable with no
-Perl or language runtime. OpenZFS's `zfs` and `zpool` commands remain the only
-runtime facilities it invokes. It manages snapshot creation and retention;
-replication is intentionally outside its scope.
+uses typed TOML values with small shorthands for dataset headers and template
+references, and compiles to one executable with no Perl or language runtime.
+OpenZFS's `zfs` and `zpool` commands remain the only runtime facilities it invokes.
+It manages snapshot creation and retention; replication is intentionally outside
+its scope.
 
 The initial implementation is usable now, but it deserves normal staging before
 being trusted with irreplaceable pools. Start with `zsnap plan`, inspect every
@@ -311,6 +312,11 @@ See [`config.example.toml`](config.example.toml) for a fully annotated example.
 Parsing is typed and strict: unknown tables/keys, unknown webhook kinds/events,
 invalid schedules, duplicate webhook names, and unsafe URL choices are rejected.
 `zsnap check` validates syntax and semantics without requiring ZFS.
+Dataset sections use the intentionally narrow `[pool/dataset]` shorthand. Simple
+template references can likewise be bare: `use_templates = [production, archive]`.
+Quote a template reference if its name contains other characters. All other
+tables and values follow TOML. The older `[datasets."pool/dataset"]` form and
+quoted template references remain accepted for compatibility.
 The core shape is:
 
 ```toml
@@ -331,17 +337,17 @@ weekly = 4
 monthly = 3
 yearly = 0
 
-[datasets."tank/data"]
-use_templates = ["production"]
+[tank/data]
+use_templates = [production]
 recursive = true
 
-[datasets."tank/data/vm".policy]
+[tank/data/vm]
 hourly = 12
 ```
 
 Templates listed in `use_templates` are applied left to right; later values win.
 An explicit child starts from its inherited recursive policy, then applies its
-templates and local `[...policy]` values.
+templates and policy values written directly in that dataset section.
 
 ### Notifications
 
@@ -440,7 +446,7 @@ defers pruning while pool capacity is below 70 percent.
 Hooks are optional arrays containing an executable and arguments:
 
 ```toml
-[datasets."tank/database".policy]
+[tank/database]
 pre_snapshot_script = ["/usr/local/libexec/zsnap/db-freeze", "--timeout", "5"]
 post_snapshot_script = ["/usr/local/libexec/zsnap/db-thaw"]
 script_timeout = 10
@@ -481,12 +487,13 @@ sudo zsnap prune
 sudo zsnap notify-test
 ```
 
-`check` is the configuration linter. It validates TOML syntax, rejects unknown
-keys, verifies value bounds, template references, recursion combinations, dataset
-names, hooks, and webhook settings. Every operational command loads the file
-through the same validator before it can query or mutate ZFS, so an invalid file
-cannot reach snapshot or prune execution. Add `--probe` only when the linter should
-also verify datasets and recursive expansion against the current host.
+`check` is the configuration linter. It validates TOML values and the dataset-header
+shorthand, rejects unknown keys, and verifies value bounds, template references,
+recursion combinations, dataset names, hooks, and webhook settings. Every
+operational command loads the file through the same validator before it can query
+or mutate ZFS, so an invalid file cannot reach snapshot or prune execution. Add
+`--probe` only when the linter should also verify datasets and recursive expansion
+against the current host.
 
 ## Migrating from Sanoid
 

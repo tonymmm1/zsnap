@@ -12,6 +12,38 @@ const DEFAULT_PREFIX: &str = "autosnap";
 const DEFAULT_LOCK_FILE: &str = "/run/zsnap/zsnap.lock";
 const MAX_SNAPSHOT_BATCH_SIZE: usize = 256;
 const MAX_PRUNE_BATCH_SIZE: usize = 128;
+const POLICY_KEYS: &[&str] = &[
+    "autosnap",
+    "autoprune",
+    "frequently",
+    "hourly",
+    "daily",
+    "weekly",
+    "monthly",
+    "yearly",
+    "frequent_period",
+    "hourly_min",
+    "daily_hour",
+    "daily_min",
+    "weekly_wday",
+    "weekly_hour",
+    "weekly_min",
+    "monthly_mday",
+    "monthly_hour",
+    "monthly_min",
+    "yearly_mon",
+    "yearly_mday",
+    "yearly_hour",
+    "yearly_min",
+    "prune_defer",
+    "pre_snapshot_script",
+    "post_snapshot_script",
+    "pre_pruning_script",
+    "pruning_script",
+    "script_timeout",
+    "no_inconsistent_snapshot",
+    "force_post_snapshot_script",
+];
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -469,10 +501,19 @@ impl Config {
     pub fn load(path: &Path) -> Result<Self> {
         let raw = fs::read_to_string(path)
             .with_context(|| format!("failed to read configuration {}", path.display()))?;
-        let config: Self = toml::from_str(&raw)
+        let config = Self::parse(&raw)
             .with_context(|| format!("failed to parse TOML configuration {}", path.display()))?;
         config.validate()?;
         Ok(config)
+    }
+
+    pub fn parse(raw: &str) -> Result<Self> {
+        let expanded = expand_config_shorthand(raw)?;
+        let mut value: toml::Value = toml::from_str(&expanded)?;
+        normalize_inline_dataset_policies(&mut value)?;
+        value
+            .try_into()
+            .context("configuration does not match the zsnap schema")
     }
 
     pub fn validate(&self) -> Result<()> {
@@ -546,6 +587,156 @@ impl Config {
         policy.apply(&section.policy);
         Ok(policy)
     }
+}
+
+fn expand_config_shorthand(raw: &str) -> Result<String> {
+    let mut expanded = String::with_capacity(raw.len());
+    for (index, line) in raw.lines().enumerate() {
+        let trimmed = line.trim();
+        if let Some(header) = friendly_dataset_header(trimmed, index + 1)? {
+            expanded.push_str(&header);
+        } else if let Some(template_list) = friendly_template_list(line, index + 1)? {
+            expanded.push_str(&template_list);
+        } else {
+            expanded.push_str(line);
+        }
+        expanded.push('\n');
+    }
+    Ok(expanded)
+}
+
+fn friendly_template_list(line: &str, line_number: usize) -> Result<Option<String>> {
+    let content = line.trim_start();
+    let indentation = &line[..line.len() - content.len()];
+    let Some((key, value)) = content.split_once('=') else {
+        return Ok(None);
+    };
+    let key = key.trim();
+    if !matches!(key, "use_templates" | "use_template") {
+        return Ok(None);
+    }
+    let value = value.trim();
+    if !value.starts_with('[') {
+        return Ok(None);
+    }
+    let Some(closing) = value.find(']') else {
+        return Ok(None);
+    };
+    let names = &value[1..closing];
+    if names.contains('"') || names.contains('\'') {
+        return Ok(None);
+    }
+    let trailing = value[closing + 1..].trim();
+    if !trailing.is_empty() && !trailing.starts_with('#') {
+        return Ok(None);
+    }
+    if names.trim().is_empty() {
+        return Ok(None);
+    }
+
+    let mut quoted = Vec::new();
+    for raw_name in names.split(',') {
+        let name = raw_name.trim();
+        if name.is_empty() || !name.chars().all(is_bare_template_character) {
+            bail!(
+                "line {line_number}: bare template names may contain only ASCII letters, numbers, '-' and '_'"
+            );
+        }
+        quoted.push(toml::Value::String(name.to_owned()).to_string());
+    }
+    let comment = if trailing.is_empty() {
+        String::new()
+    } else {
+        format!(" {trailing}")
+    };
+    Ok(Some(format!(
+        "{indentation}{key} = [{}]{comment}",
+        quoted.join(", ")
+    )))
+}
+
+fn is_bare_template_character(character: char) -> bool {
+    character.is_ascii_alphanumeric() || matches!(character, '-' | '_')
+}
+
+fn friendly_dataset_header(line: &str, line_number: usize) -> Result<Option<String>> {
+    if line.starts_with("[[") || !line.starts_with('[') {
+        return Ok(None);
+    }
+    let Some(closing) = line.find(']') else {
+        return Ok(None);
+    };
+    let raw_name = line[1..closing].trim();
+    if raw_name.starts_with("datasets.")
+        || raw_name.starts_with("templates.")
+        || raw_name.starts_with("notifications.")
+        || !raw_name.contains('/')
+    {
+        return Ok(None);
+    }
+    let trailing = line[closing + 1..].trim();
+    if !trailing.is_empty() && !trailing.starts_with('#') {
+        return Ok(None);
+    }
+
+    let dataset = if raw_name.starts_with('"') || raw_name.starts_with('\'') {
+        let probe = format!("dataset = {raw_name}");
+        let value: toml::Value = toml::from_str(&probe)
+            .with_context(|| format!("line {line_number}: invalid quoted dataset section name"))?;
+        value
+            .get("dataset")
+            .and_then(toml::Value::as_str)
+            .context("quoted dataset section name must be a string")?
+            .to_owned()
+    } else {
+        raw_name.to_owned()
+    };
+    let quoted = toml::Value::String(dataset).to_string();
+    let comment = if trailing.is_empty() {
+        String::new()
+    } else {
+        format!(" {trailing}")
+    };
+    Ok(Some(format!("[datasets.{quoted}]{comment}")))
+}
+
+fn normalize_inline_dataset_policies(value: &mut toml::Value) -> Result<()> {
+    let Some(datasets) = value
+        .as_table_mut()
+        .and_then(|root| root.get_mut("datasets"))
+    else {
+        return Ok(());
+    };
+    let datasets = datasets
+        .as_table_mut()
+        .context("datasets must be a table")?;
+    for (dataset_name, dataset_value) in datasets {
+        let dataset = dataset_value
+            .as_table_mut()
+            .with_context(|| format!("dataset {dataset_name:?} must be a table"))?;
+        let mut inline = Vec::new();
+        for key in POLICY_KEYS {
+            if let Some(value) = dataset.remove(*key) {
+                inline.push(((*key).to_owned(), value));
+            }
+        }
+        if inline.is_empty() {
+            continue;
+        }
+        let policy = dataset
+            .entry("policy")
+            .or_insert_with(|| toml::Value::Table(Default::default()))
+            .as_table_mut()
+            .with_context(|| format!("dataset {dataset_name:?} policy must be a table"))?;
+        for (key, value) in inline {
+            if policy.insert(key.clone(), value).is_some() {
+                bail!(
+                    "dataset {dataset_name:?} defines policy setting {key:?} both inline and in its policy table"
+                );
+            }
+        }
+    }
+    Ok(())
 }
 
 impl Settings {
@@ -763,6 +954,38 @@ daily = 30
         assert_eq!(policy.daily, 30);
         assert_eq!(policy.monthly, 12);
         assert_eq!(config.datasets["tank/data"].recursive, Recursion::Children);
+    }
+
+    #[test]
+    fn parses_short_dataset_headers_and_inline_policy() {
+        let config = Config::parse(
+            r#"
+version = 1
+
+[templates.base]
+hourly = 24
+
+[tank/data]
+use_templates = [base]
+recursive = true
+daily = 7
+
+["tank/archive"]
+autosnap = false
+"#,
+        )
+        .unwrap();
+        config.validate().unwrap();
+        assert_eq!(config.datasets.len(), 2);
+        assert_eq!(config.datasets["tank/data"].recursive, Recursion::Children);
+        assert_eq!(config.datasets["tank/data"].use_templates, ["base"]);
+        assert_eq!(config.datasets["tank/data"].policy.daily, Some(7));
+        assert_eq!(config.datasets["tank/archive"].policy.autosnap, Some(false));
+
+        let unknown = Config::parse("version = 1\n[tank/data]\nhourlies = 3\n")
+            .unwrap_err()
+            .to_string();
+        assert!(unknown.contains("schema"), "{unknown}");
     }
 
     #[test]
