@@ -30,6 +30,15 @@ jobs:
           ci/test-distro.sh
           contrib/zsnap.openrc
           contrib/zsnap.periodic
+      - name: Validate Bash benchmark harness
+        run: |
+          bash -n benchmarks/run-zfs-benchmark.sh benchmarks/zfs-benchmark.sh
+          SANOID_STABLE_BIN=/bin/true \
+          SANOID_DEVELOPMENT_BIN=/bin/true \
+            benchmarks/run-zfs-benchmark.sh --help >/dev/null
+          test -s benchmarks/results.md
+          test -s benchmarks/results.html
+          test -s benchmarks/results.tsv
       - name: Validate staged static installation
         run: >-
           make install-static-none

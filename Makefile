@@ -22,7 +22,7 @@ TIMER_TARGET := $(DESTDIR)$(SYSTEMD_UNIT_DIR)/zsnap.timer
 OPENRC_TARGET := $(DESTDIR)$(OPENRC_INIT_DIR)/zsnap
 PERIODIC_TARGET := $(DESTDIR)$(PERIODIC_DIR)/zsnap
 
-.PHONY: all build release test check fmt lint install install-binary install-static \
+.PHONY: all build release test check fmt lint benchmark install install-binary install-static \
 	install-static-binary install-config install-systemd install-openrc install-static-openrc \
 	install-openrc-service install-none install-static-none enable enable-openrc disable \
 	disable-openrc uninstall uninstall-systemd uninstall-openrc uninstall-common clean package \
@@ -47,6 +47,28 @@ fmt:
 
 lint:
 	$(CARGO) clippy --all-targets --all-features --locked -- -D warnings
+
+# Runs only against uniquely named, disposable sparse-file pools. The release
+# binary is built as the invoking user before the script asks for ZFS privileges.
+BENCHMARK_SANOID ?=
+BENCHMARK_SANOID_DEFAULTS ?=
+BENCHMARK_SANOID_STABLE ?= $(BENCHMARK_SANOID)
+BENCHMARK_SANOID_STABLE_DEFAULTS ?= $(BENCHMARK_SANOID_DEFAULTS)
+BENCHMARK_SANOID_DEVELOPMENT ?=
+BENCHMARK_SANOID_DEVELOPMENT_DEFAULTS ?=
+BENCHMARK_SANOID_DEVELOPMENT_REVISION ?=
+BENCHMARK_SANOID_PERL5LIB ?=
+BENCHMARK_ARGS ?=
+
+benchmark: $(BINARY)
+	ZSNAP_BIN="$(abspath $(BINARY))" \
+	SANOID_STABLE_BIN="$(BENCHMARK_SANOID_STABLE)" \
+	SANOID_STABLE_DEFAULTS="$(BENCHMARK_SANOID_STABLE_DEFAULTS)" \
+	SANOID_DEVELOPMENT_BIN="$(BENCHMARK_SANOID_DEVELOPMENT)" \
+	SANOID_DEVELOPMENT_DEFAULTS="$(BENCHMARK_SANOID_DEVELOPMENT_DEFAULTS)" \
+	SANOID_DEVELOPMENT_REVISION="$(BENCHMARK_SANOID_DEVELOPMENT_REVISION)" \
+	SANOID_PERL5LIB="$(BENCHMARK_SANOID_PERL5LIB)" \
+	./benchmarks/run-zfs-benchmark.sh $(BENCHMARK_ARGS)
 
 verify: fmt lint test release
 

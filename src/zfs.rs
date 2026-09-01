@@ -35,15 +35,25 @@ impl Inventory {
         settings: &Settings,
         configured_datasets: impl IntoIterator<Item = &'a str>,
     ) -> Result<Self> {
-        let datasets_output = run_checked(
-            &settings.zfs_command,
-            ["list", "-H", "-p", "-t", "filesystem,volume", "-o", "name"],
-        )?;
+        let configured_datasets: BTreeSet<_> =
+            configured_datasets.into_iter().map(str::to_owned).collect();
         let configured_pools: BTreeSet<_> = configured_datasets
-            .into_iter()
-            .map(Self::pool_for_dataset)
+            .iter()
+            .map(|dataset| Self::pool_for_dataset(dataset))
             .map(str::to_owned)
             .collect();
+        let mut dataset_args: Vec<OsString> = vec![
+            "list".into(),
+            "-H".into(),
+            "-p".into(),
+            "-r".into(),
+            "-t".into(),
+            "filesystem,volume".into(),
+            "-o".into(),
+            "name".into(),
+        ];
+        dataset_args.extend(configured_datasets.iter().map(OsString::from));
+        let datasets_output = run_checked(&settings.zfs_command, &dataset_args)?;
         let mut snapshot_args: Vec<OsString> = vec![
             "list".into(),
             "-H".into(),
@@ -54,12 +64,17 @@ impl Inventory {
             "-o".into(),
             format!("name,creation,{MANAGED_PROPERTY}").into(),
         ];
-        snapshot_args.extend(configured_pools.into_iter().map(OsString::from));
+        snapshot_args.extend(configured_datasets.into_iter().map(OsString::from));
         let snapshots_output = run_checked(&settings.zfs_command, &snapshot_args)?;
-        let pools_output = run_checked(
-            &settings.zpool_command,
-            ["list", "-H", "-p", "-o", "name,capacity"],
-        )?;
+        let mut pool_args: Vec<OsString> = vec![
+            "list".into(),
+            "-H".into(),
+            "-p".into(),
+            "-o".into(),
+            "name,capacity".into(),
+        ];
+        pool_args.extend(configured_pools.into_iter().map(OsString::from));
+        let pools_output = run_checked(&settings.zpool_command, &pool_args)?;
 
         Ok(Self {
             datasets: parse_datasets(&String::from_utf8_lossy(&datasets_output.stdout))?,

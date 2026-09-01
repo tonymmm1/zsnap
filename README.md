@@ -151,6 +151,59 @@ mise exec rust@1.85.0 -- cargo test --all-targets --locked
 ./target/release/zsnap --config ./config.example.toml check
 ```
 
+## ZFS benchmark
+
+`make benchmark` builds the release binary, asks for root access, creates only
+uniquely named disposable sparse-file pools, and compares Sanoid stable, current
+Sanoid development, and six zsnap concurrency/batch combinations. Every result
+is correctness-checked. The wrapper shallow-clones the two Sanoid refs under a
+temporary `/var/tmp` directory and removes them after the run; **no Sanoid source
+is tracked or copied into this repository**.
+
+```console
+make benchmark
+```
+
+Git, working OpenZFS commands, root access, and Sanoid's `Config::IniFiles` and
+`Capture::Tiny` Perl modules are benchmark-only prerequisites. zsnap's runtime
+remains a single executable.
+
+### Latest synthetic results
+
+This run used ZFS 2.4.4, three sparse 512 MiB pools on btrfs, 39 nested managed
+datasets, one warm-up, and five trials per scenario. Sanoid development was
+master commit `d39b51a`; both Sanoid checkouts reported version 2.3.0.
+
+| Implementation/settings | Snapshot median | Snapshot speedup vs stable | Prune median | Prune speedup vs stable |
+| --- | ---: | ---: | ---: | ---: |
+| Sanoid stable v2.3.0 | 1270.590 ms | 1.00× | 5289.418 ms | 1.00× |
+| Sanoid development `d39b51a` | 1568.546 ms | 0.81× | 6378.662 ms | 0.83× |
+| zsnap auto pools, default batches | **401.958 ms** | **3.16×** | **1245.211 ms** | **4.25×** |
+
+The zsnap prune median broke down as follows:
+
+| Measurement | Median | Share of full prune |
+| --- | ---: | ---: |
+| Full auto/default prune | 1245.211 ms | 100.0% |
+| Warm fresh discovery and plan only | 800.485 ms | 64.3% |
+| Snapshot/property inventory alone | 644.042 ms | 51.7% |
+| Dataset inventory alone | 151.403 ms | 12.2% |
+| Pool-capacity inventory alone | 7.294 ms | 0.6% |
+| Full minus plan (mutation/process residual) | 444.726 ms | 35.7% |
+
+The useful optimization target is therefore fresh, scoped snapshot/property
+inventory—not a persistent deletion cache. Cached prune candidates must still be
+revalidated, while stale data could delete the wrong snapshot. Batching and
+independent-pool parallelism already produced most of the measured win. Recursive
+destroy and channel-program tradeoffs are discussed in the full report.
+
+These are control-path measurements on sparse files, not storage benchmarks.
+They cannot predict physical HDD, SSD, or NVMe behavior. See the
+[`benchmark guide`](benchmarks/README.md),
+[`full Markdown report`](benchmarks/results.md),
+[`standalone HTML report`](benchmarks/results.html), and
+[`raw trial data`](benchmarks/results.tsv).
+
 ## Automated build and install
 
 This command installs build prerequisites, bootstraps the pinned Rust toolchain with
