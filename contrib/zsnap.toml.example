@@ -1,0 +1,65 @@
+# Safe starter configuration installed as /etc/zsnap/zsnap.toml.
+#
+# This file intentionally selects no ZFS datasets. zsnap never guesses a pool or
+# dataset name. List the datasets on this host, then add one or more exact names:
+#
+#   sudo zfs list -H -o name -t filesystem,volume
+#
+# For example, after replacing POOL or POOL/DATASET with a real name from that
+# command, either a pool root or a child dataset can be selected:
+#
+# [POOL]
+# use_templates = [standard]
+#
+# [POOL/DATASET]
+# use_templates = [standard]
+# recursive = true
+#
+# Until a dataset section is added, `zsnap check` reports that the configuration
+# contains no datasets and the installer will not enable a recurring schedule.
+
+version = 1
+
+[settings]
+snapshot_prefix = "autosnap"
+timezone = "local"
+max_parallel_pools = 0
+snapshot_batch_size = 128
+prune_batch_size = 64
+lock_file = "/run/zsnap/zsnap.lock"
+zfs_command = "zfs"
+zpool_command = "zpool"
+
+[notifications]
+enabled = false
+max_parallel = 4
+timeout_seconds = 10
+max_attempts = 3
+retry_backoff_milliseconds = 500
+fail_on_error = false
+
+[template_standard]
+autosnap = true
+autoprune = true
+frequently = 0
+hourly = 36
+daily = 30
+weekly = 4
+monthly = 3
+yearly = 0
+
+frequent_period = 15
+hourly_min = 0
+daily_hour = 23
+daily_min = 59
+weekly_wday = 1
+weekly_hour = 23
+weekly_min = 30
+monthly_mday = 1
+monthly_hour = 0
+monthly_min = 0
+yearly_mon = 1
+yearly_mday = 1
+yearly_hour = 0
+yearly_min = 0
+prune_defer = 0

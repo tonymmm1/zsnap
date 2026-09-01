@@ -55,6 +55,7 @@ pub struct Config {
     pub notifications: Notifications,
     #[serde(default)]
     pub templates: BTreeMap<String, PolicyPatch>,
+    #[serde(default)]
     pub datasets: BTreeMap<String, DatasetConfig>,
 }
 
@@ -593,7 +594,9 @@ fn expand_config_shorthand(raw: &str) -> Result<String> {
     let mut expanded = String::with_capacity(raw.len());
     for (index, line) in raw.lines().enumerate() {
         let trimmed = line.trim();
-        if let Some(header) = friendly_dataset_header(trimmed, index + 1)? {
+        if let Some(header) = friendly_template_header(trimmed, index + 1)? {
+            expanded.push_str(&header);
+        } else if let Some(header) = friendly_dataset_header(trimmed, index + 1)? {
             expanded.push_str(&header);
         } else if let Some(template_list) = friendly_template_list(line, index + 1)? {
             expanded.push_str(&template_list);
@@ -659,6 +662,38 @@ fn is_bare_template_character(character: char) -> bool {
     character.is_ascii_alphanumeric() || matches!(character, '-' | '_')
 }
 
+fn friendly_template_header(line: &str, line_number: usize) -> Result<Option<String>> {
+    if line.starts_with("[[") || !line.starts_with('[') {
+        return Ok(None);
+    }
+    let Some(closing) = line.find(']') else {
+        return Ok(None);
+    };
+    let raw_name = line[1..closing].trim();
+    let Some(template_name) = raw_name.strip_prefix("template_") else {
+        return Ok(None);
+    };
+    if template_name.contains('/') {
+        return Ok(None);
+    }
+    let trailing = line[closing + 1..].trim();
+    if !trailing.is_empty() && !trailing.starts_with('#') {
+        return Ok(None);
+    }
+    if template_name.is_empty() || !template_name.chars().all(is_bare_template_character) {
+        bail!(
+            "line {line_number}: template headers must use [template_NAME], where NAME contains only ASCII letters, numbers, '-' and '_'"
+        );
+    }
+    let quoted = toml::Value::String(template_name.to_owned()).to_string();
+    let comment = if trailing.is_empty() {
+        String::new()
+    } else {
+        format!(" {trailing}")
+    };
+    Ok(Some(format!("[templates.{quoted}]{comment}")))
+}
+
 fn friendly_dataset_header(line: &str, line_number: usize) -> Result<Option<String>> {
     if line.starts_with("[[") || !line.starts_with('[') {
         return Ok(None);
@@ -667,11 +702,7 @@ fn friendly_dataset_header(line: &str, line_number: usize) -> Result<Option<Stri
         return Ok(None);
     };
     let raw_name = line[1..closing].trim();
-    if raw_name.starts_with("datasets.")
-        || raw_name.starts_with("templates.")
-        || raw_name.starts_with("notifications.")
-        || !raw_name.contains('/')
-    {
+    if is_reserved_config_header(raw_name) {
         return Ok(None);
     }
     let trailing = line[closing + 1..].trim();
@@ -698,6 +729,18 @@ fn friendly_dataset_header(line: &str, line_number: usize) -> Result<Option<Stri
         format!(" {trailing}")
     };
     Ok(Some(format!("[datasets.{quoted}]{comment}")))
+}
+
+fn is_reserved_config_header(name: &str) -> bool {
+    [
+        "settings",
+        "notifications",
+        "templates",
+        "datasets",
+        "version",
+    ]
+    .iter()
+    .any(|reserved| name == *reserved || name.starts_with(&format!("{reserved}.")))
 }
 
 fn normalize_inline_dataset_policies(value: &mut toml::Value) -> Result<()> {
@@ -962,8 +1005,11 @@ daily = 30
             r#"
 version = 1
 
-[templates.base]
+[template_base]
 hourly = 24
+
+[tank]
+autosnap = false
 
 [tank/data]
 use_templates = [base]
@@ -976,7 +1022,8 @@ autosnap = false
         )
         .unwrap();
         config.validate().unwrap();
-        assert_eq!(config.datasets.len(), 2);
+        assert_eq!(config.datasets.len(), 3);
+        assert_eq!(config.datasets["tank"].policy.autosnap, Some(false));
         assert_eq!(config.datasets["tank/data"].recursive, Recursion::Children);
         assert_eq!(config.datasets["tank/data"].use_templates, ["base"]);
         assert_eq!(config.datasets["tank/data"].policy.daily, Some(7));

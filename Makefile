@@ -16,6 +16,7 @@ STATIC_BINARY := target/$(STATIC_TARGET)/release/zsnap
 STATIC_TARGET_ENV := $(shell printf '%s' '$(STATIC_TARGET)' | tr '[:lower:]-' '[:upper:]_')
 RUST_SOURCES := $(wildcard src/*.rs tests/*.rs)
 CONFIG_TARGET := $(DESTDIR)$(SYSCONFDIR)/zsnap/zsnap.toml
+CONFIG_SOURCE ?= contrib/zsnap.toml.example
 ENV_TARGET := $(DESTDIR)$(SYSCONFDIR)/zsnap/webhooks.env
 SERVICE_TARGET := $(DESTDIR)$(SYSTEMD_UNIT_DIR)/zsnap.service
 TIMER_TARGET := $(DESTDIR)$(SYSTEMD_UNIT_DIR)/zsnap.timer
@@ -97,8 +98,8 @@ install-static-binary: $(STATIC_BINARY)
 install-config:
 	install -d -m750 $(DESTDIR)$(SYSCONFDIR)/zsnap
 	@if [ ! -e "$(CONFIG_TARGET)" ]; then \
-		install -m600 config.example.toml "$(CONFIG_TARGET)"; \
-		echo "installed example configuration at $(CONFIG_TARGET)"; \
+		install -m600 "$(CONFIG_SOURCE)" "$(CONFIG_TARGET)"; \
+		echo "installed safe starter configuration at $(CONFIG_TARGET)"; \
 	else \
 		echo "preserved existing configuration at $(CONFIG_TARGET)"; \
 	fi

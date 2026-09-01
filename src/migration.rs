@@ -73,7 +73,6 @@ struct OutputHeader<'a> {
     version: u32,
     settings: &'a OutputSettings,
     notifications: &'a OutputNotifications,
-    templates: &'a BTreeMap<String, OutputPolicy>,
 }
 
 pub fn convert_sanoid(source: &str, defaults: Option<&str>) -> Result<SanoidMigration> {
@@ -268,13 +267,21 @@ fn render_output(output: &OutputConfig) -> Result<String> {
         version: output.version,
         settings: &output.settings,
         notifications: &output.notifications,
-        templates: &output.templates,
     };
-    let mut rendered = toml::to_string_pretty(&header)
-        .context("failed to render migrated TOML header and templates")?;
+    let mut rendered =
+        toml::to_string_pretty(&header).context("failed to render migrated TOML header")?;
+    for (template_name, policy) in &output.templates {
+        rendered.push('\n');
+        rendered.push_str(&render_template_header(template_name));
+        rendered.push('\n');
+        rendered.push_str(
+            &toml::to_string_pretty(policy)
+                .with_context(|| format!("failed to render template {template_name:?}"))?,
+        );
+    }
     for (dataset_name, dataset) in &output.datasets {
         rendered.push('\n');
-        if dataset_name.contains('/') {
+        if can_use_friendly_dataset_header(dataset_name) {
             rendered.push_str(&format!("[{dataset_name}]\n"));
         } else {
             let quoted = toml::Value::String(dataset_name.clone()).to_string();
@@ -292,6 +299,30 @@ fn render_output(output: &OutputConfig) -> Result<String> {
         );
     }
     Ok(rendered)
+}
+
+fn render_template_header(name: &str) -> String {
+    if !name.is_empty() && name.chars().all(is_bare_template_character) {
+        format!("[template_{name}]")
+    } else {
+        let quoted = toml::Value::String(name.to_owned()).to_string();
+        format!("[templates.{quoted}]")
+    }
+}
+
+fn can_use_friendly_dataset_header(name: &str) -> bool {
+    !name.is_empty()
+        && !name.starts_with("template_")
+        && !matches!(
+            name,
+            "settings" | "notifications" | "templates" | "datasets" | "version"
+        )
+        && name.split('/').all(|component| {
+            !component.is_empty()
+                && component.chars().all(|character| {
+                    character.is_ascii_alphanumeric() || matches!(character, '.' | '-' | '_' | ':')
+                })
+        })
 }
 
 fn render_template_list(names: &[String]) -> String {
@@ -777,6 +808,9 @@ daily = 60
         );
         assert!(migration.config_toml.contains("[tank/data]"));
         assert!(!migration.config_toml.contains("[datasets.\"tank/data\"]"));
+        assert!(migration.config_toml.contains("[template_sanoid_defaults]"));
+        assert!(migration.config_toml.contains("[template_production]"));
+        assert!(!migration.config_toml.contains("[templates.production]"));
         assert!(
             migration
                 .config_toml
@@ -913,9 +947,11 @@ weekly_wday = 0
 
     #[test]
     fn keeps_first_duplicate_like_sanoid() {
-        let migration = convert_sanoid("[tank/data]\nhourly = 12\nhourly = 99\n", None).unwrap();
+        let migration = convert_sanoid("[tank]\nhourly = 12\nhourly = 99\n", None).unwrap();
         let config = Config::parse(&migration.config_toml).unwrap();
-        assert_eq!(config.datasets["tank/data"].policy.hourly, Some(12));
+        assert_eq!(config.datasets["tank"].policy.hourly, Some(12));
+        assert!(migration.config_toml.contains("[tank]"));
+        assert!(!migration.config_toml.contains("[datasets.\"tank\"]"));
         assert!(
             migration
                 .warnings

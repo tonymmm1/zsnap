@@ -194,7 +194,6 @@ if [ "$static_binary" -eq 1 ]; then
     openrc) install_target=install-static-openrc ;;
     none) install_target=install-static-none ;;
   esac
-  run_privileged make "$install_target" STATIC_TARGET="$static_target" MUSL_CC="$musl_compiler"
 else
   make release
   case "$init_system" in
@@ -202,11 +201,29 @@ else
     openrc) install_target=install-openrc ;;
     none) install_target=install-none ;;
   esac
+fi
+
+config_was_present=0
+if run_privileged test -e /etc/zsnap/zsnap.toml; then
+  config_was_present=1
+fi
+
+if [ "$static_binary" -eq 1 ]; then
+  run_privileged make "$install_target" STATIC_TARGET="$static_target" MUSL_CC="$musl_compiler"
+else
   run_privileged make "$install_target"
 fi
 
 if [ "$enable_schedule" -eq 1 ] && [ "$init_system" != none ]; then
-  if run_privileged /usr/local/sbin/zsnap --config /etc/zsnap/zsnap.toml check --probe; then
+  if [ "$config_was_present" -eq 0 ]; then
+    echo >&2
+    echo "A safe starter configuration was installed without selecting a ZFS dataset." >&2
+    echo "zsnap never guesses a default pool name, so scheduling was not enabled." >&2
+    echo "List this host's datasets with:" >&2
+    echo "  sudo zfs list -H -o name -t filesystem,volume" >&2
+    echo "Then edit /etc/zsnap/zsnap.toml and add the exact dataset section(s) you want." >&2
+    enable_schedule=0
+  elif run_privileged /usr/local/sbin/zsnap --config /etc/zsnap/zsnap.toml check --probe; then
     case "$init_system" in
       systemd) run_privileged make enable ;;
       openrc) run_privileged make enable-openrc ;;
@@ -215,7 +232,12 @@ if [ "$enable_schedule" -eq 1 ] && [ "$init_system" != none ]; then
     echo >&2
     echo "The binary and scheduler files were installed, but scheduling was not enabled because" >&2
     echo "/etc/zsnap/zsnap.toml does not yet resolve on this host." >&2
-    echo "Edit it, run 'sudo zsnap check --probe', then enable the matching scheduler." >&2
+    echo "No pool name is assumed. List real names with:" >&2
+    echo "  sudo zfs list -H -o name -t filesystem,volume" >&2
+    echo "Replace or remove any example dataset sections, then run:" >&2
+    echo "  sudo zsnap check --probe" >&2
+    echo "  sudo zsnap plan" >&2
+    echo "After reviewing the plan, rerun ./install.sh to enable the scheduler." >&2
     enable_schedule=0
   fi
 fi

@@ -151,6 +151,7 @@ commands are:
 ```console
 mise exec rust@1.85.0 -- cargo build --release --locked
 mise exec rust@1.85.0 -- cargo test --all-targets --locked
+# After uncommenting and naming at least one example dataset:
 ./target/release/zsnap --config ./config.example.toml check
 ```
 
@@ -217,6 +218,13 @@ read-only ZFS probe succeeds:
 ./install.sh --install-deps --bootstrap-rust
 ```
 
+Run the installer as your normal user; it invokes `sudo` only for system files and
+scheduler operations. A fresh installation receives a safe starter configuration
+with templates but no active dataset sections. zsnap deliberately never guesses a
+pool name. Select exact names from `sudo zfs list -H -o name -t filesystem,volume`,
+add them to `/etc/zsnap/zsnap.toml`, validate, and review the plan before enabling
+the scheduler.
+
 `--install-deps` supports `apt`, `dnf`/`yum`, `apk`, and `pacman`. It deliberately
 does not install ZFS because ZFS packaging and kernel-module choices are
 distribution-specific. Install OpenZFS first and ensure both `zfs` and `zpool` are
@@ -239,9 +247,11 @@ static-musl build.
 ### systemd
 
 The installer builds a release binary, installs it to `/usr/local/sbin/zsnap`,
-installs `/etc/zsnap/zsnap.toml` only when that file does not already exist, and
-installs the systemd units. It enables the 15-minute timer only after the configured
-datasets pass a read-only ZFS probe:
+installs a dataset-neutral starter at `/etc/zsnap/zsnap.toml` only when that file
+does not already exist, and installs the systemd units. An existing configuration
+is always preserved. It enables the 15-minute timer only when a pre-existing
+configuration's datasets pass a read-only ZFS probe; a fresh starter must first be
+edited and reviewed:
 
 ```console
 ./install.sh
@@ -252,6 +262,7 @@ configuration and preview the live plan before enabling it:
 
 ```console
 sudoedit /etc/zsnap/zsnap.toml
+sudo zfs list -H -o name -t filesystem,volume
 sudo zsnap check --probe
 sudo zsnap plan
 sudo make enable
@@ -275,8 +286,8 @@ For Alpine/OpenRC, use `sudo make install-openrc` followed by
 `crond` starts. `install-none` installs only the binary and configuration.
 
 `PREFIX`, `BINDIR`, `SYSCONFDIR`, `SYSTEMD_UNIT_DIR`, `OPENRC_INIT_DIR`,
-`PERIODIC_DIR`, and packaging `DESTDIR` are overridable. The supplied scheduler
-files assume the default `/usr/local/sbin` and `/etc` locations. `make uninstall`
+`PERIODIC_DIR`, `CONFIG_SOURCE`, and packaging `DESTDIR` are overridable. The
+supplied scheduler files assume the default `/usr/local/sbin` and `/etc` locations. `make uninstall`
 handles systemd; `make uninstall-openrc` handles OpenRC. Both deliberately preserve
 the user-edited configuration and webhook environment file.
 
@@ -309,14 +320,22 @@ sudo install -m755 zsnap-0.1.0-x86_64-unknown-linux-musl/zsnap /usr/local/sbin/z
 ## Configure
 
 See [`config.example.toml`](config.example.toml) for a fully annotated example.
-Parsing is typed and strict: unknown tables/keys, unknown webhook kinds/events,
-invalid schedules, duplicate webhook names, and unsafe URL choices are rejected.
-`zsnap check` validates syntax and semantics without requiring ZFS.
-Dataset sections use the intentionally narrow `[pool/dataset]` shorthand. Simple
-template references can likewise be bare: `use_templates = [production, archive]`.
-Quote a template reference if its name contains other characters. All other
-tables and values follow TOML. The older `[datasets."pool/dataset"]` form and
-quoted template references remain accepted for compatibility.
+Its illustrative dataset stanzas are all commented out, so the file cannot manage
+anything until an administrator explicitly configures at least one pool or dataset.
+Parsing is typed and strict: unknown keys in known sections, unknown webhook
+kinds/events, invalid schedules, duplicate webhook names, and unsafe URL choices
+are rejected. `zsnap check` validates syntax and semantics without requiring ZFS.
+Dataset sections use `[pool]` or `[pool/dataset]`, and template sections use
+`[template_name]`. Simple template references can likewise be bare:
+`use_templates = [production, archive]`. Quote a template reference if its name
+contains other characters. All other tables and values follow TOML. The older
+`[datasets."pool/dataset"]` and `[templates.name]` forms, plus quoted template
+references, remain accepted for compatibility.
+
+Because a one-component header such as `[tank]` is a valid pool root, any otherwise
+unknown top-level header is interpreted as a dataset. Use `check --probe` to catch a
+misspelled root pool. A pool named like a reserved configuration table or beginning
+with `template_` can still be written with the legacy `[datasets."pool"]` form.
 The core shape is:
 
 ```toml
@@ -327,7 +346,7 @@ snapshot_prefix = "autosnap"
 timezone = "local"
 max_parallel_pools = 0
 
-[templates.production]
+[template_production]
 autosnap = true
 autoprune = true
 frequently = 0
@@ -467,7 +486,7 @@ zsnap migrate-sanoid --input /etc/sanoid/sanoid.conf \
   --output ./zsnap.migrated.toml
 
 # Offline syntax and policy validation; does not require ZFS.
-zsnap --config ./config.example.toml check
+zsnap --config /etc/zsnap/zsnap.toml check
 
 # Validate dataset names and recursive expansion against this host.
 sudo zsnap check --probe
@@ -525,6 +544,13 @@ keys are reported and omitted because monitoring is outside zsnap's scope. A
 setting that cannot be represented without changing snapshot coverage, such as
 `skip_children = yes`, stops conversion rather than silently emitting a lossy
 policy.
+
+The generated `sanoid_defaults` template is the baseline Sanoid normally applies
+implicitly: its built-in defaults, overlaid by `[template_default]` from the
+supplied `sanoid.defaults.conf` and the source configuration. The converter applies
+it first to every non-inherited dataset; recursive children receive that baseline
+through their parent. Making it explicit prevents partially specified Sanoid
+policies from changing behavior during migration.
 
 Keep `snapshot_prefix = "autosnap"`. Existing Sanoid snapshots will suppress
 unnecessary duplicate snapshots, but `zsnap` will never prune them because they

@@ -43,4 +43,8 @@ export PATH="/root/.cargo/bin:$PATH"
 cd "$ci_work"
 cargo test --all-targets --locked
 cargo build --release --locked
-./target/release/zsnap --config ./config.example.toml check
+if ./target/release/zsnap --config ./config.example.toml check > /tmp/zsnap-example-check.log 2>&1; then
+  echo "commented example unexpectedly passed without a configured dataset" >&2
+  exit 1
+fi
+grep -F "at least one dataset" /tmp/zsnap-example-check.log >/dev/null

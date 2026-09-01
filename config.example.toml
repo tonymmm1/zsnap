@@ -1,5 +1,8 @@
-# zsnap configuration format. Dataset headers allow the [pool/dataset] shorthand,
-# and use_templates allows bare simple names; other values use normal TOML syntax.
+# Fully worked documentation example; it is not installed as the host config.
+# Dataset names below are illustrative and are never treated as defaults.
+# zsnap configuration format. Dataset headers allow [pool] and [pool/dataset],
+# template headers use [template_name], and use_templates accepts bare simple names.
+# Other values use normal TOML syntax.
 version = 1
 
 [settings]
@@ -72,7 +75,7 @@ fail_on_error = false
 # url = "https://hooks.slack.com/services/REPLACE/REPLACE/REPLACE"
 # events = ["failure"]
 
-[templates.production]
+[template_production]
 autosnap = true
 autoprune = true
 frequently = 0
@@ -103,7 +106,7 @@ yearly_min = 0
 # this capacity percentage.
 prune_defer = 0
 
-[templates.backup]
+[template_backup]
 autosnap = false
 autoprune = true
 frequently = 0
@@ -113,17 +116,19 @@ weekly = 4
 monthly = 12
 yearly = 0
 
-# Manage every dataset below tank/data individually. Explicit child sections
-# can override this inherited policy.
-[tank/data]
-use_templates = [production]
-recursive = true
+# Dataset sections are intentionally commented out. Nothing is managed until an
+# administrator replaces or confirms a name and uncomments the whole stanza.
+# Manage every dataset below tank/data individually. Explicit child sections can
+# override this inherited policy. A pool root is also supported as [tank].
+# [tank/data]
+# use_templates = [production]
+# recursive = true
 
 # This child starts with its inherited policy, reapplies production, then changes
 # only hourly retention.
-[tank/data/vm]
-use_templates = [production]
-hourly = 12
+# [tank/data/vm]
+# use_templates = [production]
+# hourly = 12
 
 # Hooks are argv arrays, never implicit shell strings. Policy fields live directly
 # in the dataset section, just like the hourly override above.
@@ -137,6 +142,6 @@ hourly = 12
 
 # `recursive = "zfs"` uses `zfs snapshot -r` for atomic tree-wide snapshots.
 # Child policy sections are intentionally rejected under an atomic root.
-[archive/incoming]
-use_templates = [backup]
-recursive = "zfs"
+# [archive/incoming]
+# use_templates = [backup]
+# recursive = "zfs"

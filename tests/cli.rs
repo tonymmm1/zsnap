@@ -4,6 +4,7 @@ use std::process::Command;
 
 use serde_json::Value;
 use tempfile::tempdir;
+use zsnap::config::Config;
 
 #[test]
 fn plans_and_executes_against_fake_zfs_tools() {
@@ -55,7 +56,7 @@ zpool_command = "{}"
 lock_file = "{}"
 max_parallel_pools = 0
 
-[templates.test]
+[template_test]
 autosnap = true
 autoprune = true
 frequently = 0
@@ -126,8 +127,12 @@ use_templates = [test]
 }
 
 #[test]
-fn distributed_example_configuration_is_valid() {
+fn distributed_example_is_inert_until_a_dataset_is_uncommented() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let raw = fs::read_to_string(root.join("config.example.toml")).unwrap();
+    let config = Config::parse(&raw).unwrap();
+    assert!(config.datasets.is_empty());
+
     let output = Command::new(env!("CARGO_BIN_EXE_zsnap"))
         .args([
             "--config",
@@ -136,10 +141,22 @@ fn distributed_example_configuration_is_valid() {
         ])
         .output()
         .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("at least one dataset"));
+}
+
+#[test]
+fn installed_starter_configuration_never_assumes_a_dataset() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let raw = fs::read_to_string(root.join("contrib/zsnap.toml.example")).unwrap();
+    let config = Config::parse(&raw).unwrap();
+    assert!(config.datasets.is_empty());
     assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
+        config
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("at least one dataset")
     );
 }
 
