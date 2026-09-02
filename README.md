@@ -4,6 +4,14 @@
 
 <h1 align="center">zsnap</h1>
 
+<p align="center">
+  <a href="https://tonymmm1.github.io/zsnap/"><strong>Website</strong></a>
+  ·
+  <a href="https://github.com/tonymmm1/zsnap/releases/latest">Download</a>
+  ·
+  <a href="config.example.toml">Example configuration</a>
+</p>
+
 `zsnap` is a policy-driven ZFS snapshot manager written in Rust. It takes the
 useful snapshot lifecycle ideas from [Sanoid](https://github.com/jimsalterjrs/sanoid),
 uses typed TOML values with small shorthands for dataset headers and template
