@@ -17,6 +17,9 @@ use crate::config::{
 };
 
 const MAX_MESSAGE_CHARACTERS: usize = 1_900;
+const MAX_DETAIL_CHARACTERS: usize = 500;
+/// Room kept for the closing code fence and the "more details" line.
+const DETAIL_OVERFLOW_RESERVE: usize = 80;
 const MAX_RETRY_DELAY_MILLISECONDS: u64 = 30_000;
 const WEBHOOK_ENVIRONMENT_FILE: &str = "webhooks.env";
 
@@ -27,6 +30,45 @@ pub enum DeliveryEvent {
     Failure,
     Success,
     Test,
+}
+
+/// A provider-neutral notification rendered into each webhook's native markup.
+#[derive(Debug, Clone, Default)]
+pub struct Notice {
+    /// Short headline such as "zsnap run failed".
+    pub headline: String,
+    pub host: String,
+    pub fields: Vec<NoticeField>,
+    /// Heading shown above `details`, such as "Errors (2)".
+    pub details_heading: String,
+    /// Verbatim diagnostic lines, rendered in a code block where supported.
+    pub details: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct NoticeField {
+    pub label: String,
+    pub value: String,
+    /// Render the value as inline code (paths, commands, identifiers).
+    pub code: bool,
+}
+
+impl NoticeField {
+    pub fn text(label: &str, value: impl Into<String>) -> Self {
+        Self {
+            label: label.to_owned(),
+            value: value.into(),
+            code: false,
+        }
+    }
+
+    pub fn code(label: &str, value: impl Into<String>) -> Self {
+        Self {
+            label: label.to_owned(),
+            value: value.into(),
+            code: true,
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -80,12 +122,12 @@ pub struct NotificationDelivery {
 pub fn deliver(
     config: &Notifications,
     event: DeliveryEvent,
-    message: &str,
+    notice: &Notice,
 ) -> Result<NotificationReport> {
     deliver_with_policy(
         config,
         event,
-        message,
+        notice,
         TransportPolicy::HttpsOnly,
         &WebhookEnvironment::new(),
     )
@@ -107,14 +149,14 @@ pub fn environment_file_for_config(config_path: &Path) -> PathBuf {
 pub fn deliver_with_environment_file(
     config: &Notifications,
     event: DeliveryEvent,
-    message: &str,
+    notice: &Notice,
     environment_file: &Path,
 ) -> Result<NotificationReport> {
     let file_environment = load_environment_file(environment_file)?;
     deliver_with_policy(
         config,
         event,
-        message,
+        notice,
         TransportPolicy::HttpsOnly,
         &file_environment,
     )
@@ -123,7 +165,7 @@ pub fn deliver_with_environment_file(
 fn deliver_with_policy(
     config: &Notifications,
     event: DeliveryEvent,
-    message: &str,
+    notice: &Notice,
     transport_policy: TransportPolicy,
     file_environment: &WebhookEnvironment,
 ) -> Result<NotificationReport> {
@@ -157,7 +199,6 @@ fn deliver_with_policy(
         .user_agent(format!("zsnap/{}", env!("CARGO_PKG_VERSION")))
         .build()
         .into();
-    let message = truncate_message(message);
 
     let mut deliveries = pool.install(|| {
         selected
@@ -167,7 +208,7 @@ fn deliver_with_policy(
                     &agent,
                     config,
                     webhook,
-                    &message,
+                    &render(webhook.kind, event, notice),
                     transport_policy,
                     file_environment,
                 )
@@ -271,6 +312,144 @@ fn payload(kind: WebhookKind, message: &str) -> String {
         WebhookKind::Flock | WebhookKind::Slack => serde_json::json!({ "text": message }),
     }
     .to_string()
+}
+
+#[derive(Clone, Copy)]
+enum Markup {
+    Discord,
+    Slack,
+    Plain,
+}
+
+impl Markup {
+    const fn for_kind(kind: WebhookKind) -> Self {
+        match kind {
+            WebhookKind::Discord => Self::Discord,
+            WebhookKind::Slack => Self::Slack,
+            WebhookKind::Flock => Self::Plain,
+        }
+    }
+
+    fn bold(self, text: &str) -> String {
+        match self {
+            Self::Discord => format!("**{}**", self.escape(text)),
+            Self::Slack => format!("*{}*", self.escape(text)),
+            Self::Plain => text.to_owned(),
+        }
+    }
+
+    fn code(self, text: &str) -> String {
+        match self {
+            // A backtick would close the span early, so swap in a look-alike.
+            Self::Discord => format!("`{}`", text.replace('`', "ˋ")),
+            Self::Slack => format!("`{}`", escape_slack(text).replace('`', "ˋ")),
+            Self::Plain => text.to_owned(),
+        }
+    }
+
+    /// Escape plain text so hostnames or messages cannot inject formatting.
+    fn escape(self, text: &str) -> String {
+        match self {
+            Self::Discord => {
+                let mut escaped = String::with_capacity(text.len());
+                for character in text.chars() {
+                    if matches!(character, '\\' | '*' | '_' | '~' | '`' | '|' | '[' | ']') {
+                        escaped.push('\\');
+                    }
+                    escaped.push(character);
+                }
+                escaped
+            }
+            Self::Slack => escape_slack(text),
+            Self::Plain => text.to_owned(),
+        }
+    }
+
+    const fn fences(self) -> (&'static str, &'static str) {
+        match self {
+            Self::Discord => ("\n```text", "\n```"),
+            Self::Slack => ("\n```", "\n```"),
+            Self::Plain => ("", ""),
+        }
+    }
+
+    fn detail(self, text: &str) -> String {
+        match self {
+            Self::Discord => text.replace("```", "ˋˋˋ"),
+            Self::Slack => escape_slack(text).replace("```", "ˋˋˋ"),
+            Self::Plain => format!("- {}", text.replace('\n', "\n  ")),
+        }
+    }
+}
+
+fn escape_slack(text: &str) -> String {
+    text.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
+/// Render a notice for one provider, keeping it inside the shared message budget.
+///
+/// Fields are always kept; detail lines are added in order until the budget runs out, and
+/// the remainder is summarized so a closing code fence is never cut off.
+fn render(kind: WebhookKind, event: DeliveryEvent, notice: &Notice) -> String {
+    let markup = Markup::for_kind(kind);
+    let icon = match event {
+        DeliveryEvent::Failure => "❌",
+        DeliveryEvent::Success => "✅",
+        DeliveryEvent::Test => "🔔",
+    };
+    let mut text = format!(
+        "{icon} {} on {}",
+        markup.bold(&notice.headline),
+        markup.code(&notice.host)
+    );
+    for field in &notice.fields {
+        let value = if field.code {
+            markup.code(&field.value)
+        } else {
+            markup.escape(&field.value)
+        };
+        text.push('\n');
+        text.push_str(&markup.bold(&format!("{}:", field.label)));
+        text.push(' ');
+        text.push_str(&value);
+    }
+
+    if !notice.details.is_empty() {
+        let (open, close) = markup.fences();
+        text.push('\n');
+        text.push_str(&markup.bold(&format!("{}:", notice.details_heading)));
+        text.push_str(open);
+        let mut budget = MAX_MESSAGE_CHARACTERS
+            .saturating_sub(text.chars().count() + close.chars().count() + DETAIL_OVERFLOW_RESERVE);
+        let mut shown = 0;
+        for detail in &notice.details {
+            let limit = if shown == 0 {
+                // Always show the first error, even if it has to be shortened further.
+                MAX_DETAIL_CHARACTERS.min(budget.saturating_sub(1))
+            } else {
+                MAX_DETAIL_CHARACTERS
+            };
+            let line = format!("\n{}", markup.detail(&shorten(detail.trim(), limit)));
+            let length = line.chars().count();
+            if length > budget {
+                break;
+            }
+            text.push_str(&line);
+            budget -= length;
+            shown += 1;
+        }
+        text.push_str(close);
+        let omitted = notice.details.len() - shown;
+        if omitted > 0 {
+            text.push('\n');
+            text.push_str(&markup.escape(&format!(
+                "…and {omitted} more; see the host log for the full list"
+            )));
+        }
+    }
+    shorten(&text, MAX_MESSAGE_CHARACTERS).into_owned()
 }
 
 fn resolve_url(
@@ -409,11 +588,11 @@ fn describe_error(error: &ureq::Error, url: &str) -> String {
     }
 }
 
-fn truncate_message(message: &str) -> Cow<'_, str> {
-    if message.chars().count() <= MAX_MESSAGE_CHARACTERS {
-        return Cow::Borrowed(message);
+fn shorten(text: &str, limit: usize) -> Cow<'_, str> {
+    if text.chars().count() <= limit {
+        return Cow::Borrowed(text);
     }
-    let mut shortened: String = message.chars().take(MAX_MESSAGE_CHARACTERS - 1).collect();
+    let mut shortened: String = text.chars().take(limit.saturating_sub(1)).collect();
     shortened.push('…');
     Cow::Owned(shortened)
 }
@@ -450,7 +629,7 @@ mod tests {
     #[test]
     fn truncation_is_unicode_safe_and_within_discord_limit() {
         let input = "🦀".repeat(2_001);
-        let output = truncate_message(&input);
+        let output = shorten(&input, MAX_MESSAGE_CHARACTERS);
         assert_eq!(output.chars().count(), MAX_MESSAGE_CHARACTERS);
         assert!(output.ends_with('…'));
     }
@@ -475,6 +654,103 @@ mod tests {
             assert_eq!(value["text"], "hello");
             assert!(value.get("content").is_none());
         }
+    }
+
+    fn failure_notice(details: Vec<String>) -> Notice {
+        Notice {
+            headline: "zsnap run failed".to_owned(),
+            host: "nas01".to_owned(),
+            fields: vec![
+                NoticeField::text("Snapshots", "created 1 of 2"),
+                NoticeField::code("Config", "/etc/zsnap/zsnap.toml"),
+            ],
+            details_heading: format!("Errors ({})", details.len()),
+            details,
+        }
+    }
+
+    #[test]
+    fn discord_failures_show_each_error_in_a_closed_code_block() {
+        let notice = failure_notice(vec![
+            "[tank] \"zfs\" \"snapshot\" failed with exit status: 1: out of space".to_owned(),
+            "[backup] hook \"/usr/local/bin/pre\" timed out after 30s".to_owned(),
+        ]);
+        let text = render(WebhookKind::Discord, DeliveryEvent::Failure, &notice);
+        assert!(
+            text.starts_with("❌ **zsnap run failed** on `nas01`\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("**Config:** `/etc/zsnap/zsnap.toml`"),
+            "{text}"
+        );
+        assert!(text.contains("**Errors (2):**\n```text\n[tank]"), "{text}");
+        assert!(text.contains("timed out after 30s\n```"), "{text}");
+        assert!(!text.contains("more; see"), "{text}");
+    }
+
+    #[test]
+    fn long_error_lists_stay_within_budget_and_keep_the_fence_closed() {
+        let details = (0..40)
+            .map(|index| format!("[tank] error {index}: {}", "x".repeat(200)))
+            .collect();
+        let text = render(
+            WebhookKind::Discord,
+            DeliveryEvent::Failure,
+            &failure_notice(details),
+        );
+        assert!(text.chars().count() <= MAX_MESSAGE_CHARACTERS);
+        assert_eq!(text.matches("```").count(), 2, "{text}");
+        assert!(text.contains("[tank] error 0:"));
+        assert!(
+            text.ends_with("more; see the host log for the full list"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn an_oversized_first_error_is_shortened_rather_than_dropped() {
+        let text = render(
+            WebhookKind::Discord,
+            DeliveryEvent::Failure,
+            &failure_notice(vec!["y".repeat(5_000)]),
+        );
+        assert!(text.contains("yyy…\n```"), "{text}");
+        assert!(!text.contains("more; see"));
+    }
+
+    #[test]
+    fn untrusted_text_cannot_break_out_of_formatting() {
+        let mut notice = failure_notice(vec!["stderr with ``` fence & <tag>".to_owned()]);
+        notice.host = "evil`host".to_owned();
+        notice.fields = vec![NoticeField::text("Message", "*bold* _it_ [link](x)")];
+
+        let discord = render(WebhookKind::Discord, DeliveryEvent::Failure, &notice);
+        assert!(discord.contains("`evilˋhost`"), "{discord}");
+        assert!(
+            discord.contains("\\*bold\\* \\_it\\_ \\[link\\](x)"),
+            "{discord}"
+        );
+        assert_eq!(discord.matches("```").count(), 2, "{discord}");
+
+        let slack = render(WebhookKind::Slack, DeliveryEvent::Failure, &notice);
+        assert!(
+            slack.starts_with("❌ *zsnap run failed* on `evilˋhost`"),
+            "{slack}"
+        );
+        assert!(slack.contains("&amp; &lt;tag&gt;"), "{slack}");
+    }
+
+    #[test]
+    fn flock_receives_plain_text() {
+        let notice = failure_notice(vec!["first\nsecond line".to_owned()]);
+        let text = render(WebhookKind::Flock, DeliveryEvent::Failure, &notice);
+        assert!(!text.contains('`') && !text.contains('*'), "{text}");
+        assert!(text.contains("Config: /etc/zsnap/zsnap.toml"), "{text}");
+        assert!(
+            text.contains("Errors (1):\n- first\n  second line"),
+            "{text}"
+        );
     }
 
     #[test]
@@ -530,7 +806,7 @@ mod tests {
         let report = deliver_with_policy(
             &config,
             DeliveryEvent::Failure,
-            "test",
+            &Notice::default(),
             TransportPolicy::TestHttp,
             &WebhookEnvironment::new(),
         )

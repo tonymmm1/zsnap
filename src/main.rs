@@ -12,7 +12,7 @@ use zsnap::config::{Config, ScheduleTimezone};
 use zsnap::executor::{ExecutionReport, execute};
 use zsnap::lock::RunLock;
 use zsnap::migration::convert_sanoid;
-use zsnap::notification::{self, DeliveryEvent, NotificationReport};
+use zsnap::notification::{self, DeliveryEvent, Notice, NoticeField, NotificationReport};
 use zsnap::planner::{Plan, build_plan, resolve_datasets};
 use zsnap::status::StatusCache;
 use zsnap::zfs::Inventory;
@@ -120,6 +120,35 @@ struct RunSummary {
     pools: usize,
 }
 
+/// Execution finished but some ZFS commands or hooks failed.
+///
+/// Carries the individual errors so failure notifications can show them, not just a count.
+#[derive(Debug)]
+struct OperationsFailed {
+    errors: Vec<String>,
+    snapshots_created: usize,
+    snapshots_planned: usize,
+    snapshots_pruned: usize,
+    prunes_planned: usize,
+    prunes_skipped: usize,
+    pools: usize,
+}
+
+impl std::fmt::Display for OperationsFailed {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "{} operation(s) failed after creating {} and pruning {} snapshot(s) across {} pool(s)",
+            self.errors.len(),
+            self.snapshots_created,
+            self.snapshots_pruned,
+            self.pools
+        )
+    }
+}
+
+impl std::error::Error for OperationsFailed {}
+
 #[derive(Serialize)]
 struct StatusOutput<'a> {
     source: &'a str,
@@ -151,37 +180,23 @@ fn main() -> Result<()> {
     }
 
     let notification_command = mutating_command(&cli.command);
+    let started_at = Local::now();
     let started = Instant::now();
     let result = run_zfs_command(&cli, &config);
     let mut notification_error = None;
     if let Some(command) = notification_command {
-        let (event, detail) = match &result {
-            Ok(summary) => (
-                DeliveryEvent::Success,
-                format!(
-                    "Created {} snapshot(s), pruned {} snapshot(s), protected {} snapshot(s), {} pool(s).",
-                    summary.snapshots_created,
-                    summary.snapshots_pruned,
-                    summary.snapshots_protected,
-                    summary.pools
-                ),
-            ),
-            Err(error) => (DeliveryEvent::Failure, format!("Error: {error:#}")),
-        };
-        let status = if event == DeliveryEvent::Success {
-            "SUCCESS"
-        } else {
-            "FAILURE"
-        };
-        let message = format!(
-            "zsnap {command} {status} on {}\nDuration: {:.3}s\n{detail}",
-            notification::hostname(&config.notifications),
+        let (event, notice) = run_notice(
+            command,
+            &config,
+            &cli.config,
+            started_at,
             started.elapsed().as_secs_f64(),
+            &result,
         );
         match notification::deliver_with_environment_file(
             &config.notifications,
             event,
-            &message,
+            &notice,
             &webhook_environment_file,
         ) {
             Ok(report) => {
@@ -276,13 +291,16 @@ fn run_zfs_command(cli: &Cli, config: &Config) -> Result<RunSummary> {
     }
     print_report(&plan, &report, cli.json, cli.verbose)?;
     if !report.succeeded() {
-        bail!(
-            "{} operation(s) failed after creating {} and pruning {} snapshot(s) across {} pool(s)",
-            report.errors.len(),
-            report.snapshots_created,
-            report.snapshots_pruned,
-            plan.pools().len()
-        );
+        return Err(OperationsFailed {
+            errors: report.errors,
+            snapshots_created: report.snapshots_created,
+            snapshots_planned: plan.snapshot_count(),
+            snapshots_pruned: report.snapshots_pruned,
+            prunes_planned: plan.prune_count(),
+            prunes_skipped: report.prunes_skipped_after_snapshot_failure,
+            pools: plan.pools().len(),
+        }
+        .into());
     }
     Ok(RunSummary {
         snapshots_created: report.snapshots_created,
@@ -290,6 +308,104 @@ fn run_zfs_command(cli: &Cli, config: &Config) -> Result<RunSummary> {
         snapshots_protected: plan.protected_snapshot_count(),
         pools: plan.pools().len(),
     })
+}
+
+/// Build the success or failure notification for a mutating command.
+fn run_notice(
+    command: &str,
+    config: &Config,
+    config_path: &Path,
+    started_at: chrono::DateTime<Local>,
+    elapsed_seconds: f64,
+    result: &Result<RunSummary>,
+) -> (DeliveryEvent, Notice) {
+    let mut notice = Notice {
+        host: notification::hostname(&config.notifications),
+        ..Notice::default()
+    };
+    let timing = format!(
+        "{} (took {elapsed_seconds:.2}s)",
+        started_at.format("%Y-%m-%d %H:%M:%S %:z")
+    );
+    let event = match result {
+        Ok(summary) => {
+            notice.headline = format!("zsnap {command} succeeded");
+            notice.fields = vec![
+                NoticeField::text("Started", timing),
+                NoticeField::text(
+                    "Snapshots",
+                    format!(
+                        "{} created, {} pruned, {} protected across {} pool(s)",
+                        summary.snapshots_created,
+                        summary.snapshots_pruned,
+                        summary.snapshots_protected,
+                        summary.pools
+                    ),
+                ),
+            ];
+            DeliveryEvent::Success
+        }
+        Err(error) => {
+            notice.headline = format!("zsnap {command} failed");
+            notice.fields.push(NoticeField::text("Started", timing));
+            if let Some(failed) = error.downcast_ref::<OperationsFailed>() {
+                let mut snapshots = format!(
+                    "created {} of {}, pruned {} of {} across {} pool(s)",
+                    failed.snapshots_created,
+                    failed.snapshots_planned,
+                    failed.snapshots_pruned,
+                    failed.prunes_planned,
+                    failed.pools
+                );
+                if failed.prunes_skipped > 0 {
+                    snapshots.push_str(&format!(
+                        "; {} prune(s) skipped after a snapshot failure",
+                        failed.prunes_skipped
+                    ));
+                }
+                notice
+                    .fields
+                    .push(NoticeField::text("Snapshots", snapshots));
+                notice.details_heading = format!("Errors ({})", failed.errors.len());
+                notice.details = failed.errors.clone();
+            } else {
+                // The run stopped before execution (lock, discovery, planning); show the
+                // whole cause chain, one link per line.
+                notice.details_heading = "Error".to_owned();
+                notice.details = error
+                    .chain()
+                    .enumerate()
+                    .map(|(index, cause)| {
+                        if index == 0 {
+                            cause.to_string()
+                        } else {
+                            format!("caused by: {cause}")
+                        }
+                    })
+                    .collect();
+            }
+            DeliveryEvent::Failure
+        }
+    };
+    notice.fields.push(NoticeField::code(
+        "Config",
+        config_path.display().to_string(),
+    ));
+    notice.fields.push(NoticeField::text(
+        "Version",
+        format!("zsnap {}", env!("CARGO_PKG_VERSION")),
+    ));
+    if let Some(logs) = journal_command() {
+        notice.fields.push(NoticeField::code("Logs", logs));
+    }
+    (event, notice)
+}
+
+/// Return a journalctl command for this exact run when started by systemd.
+fn journal_command() -> Option<String> {
+    let invocation = std::env::var("INVOCATION_ID").ok()?;
+    let valid = !invocation.is_empty() && invocation.chars().all(|c| c.is_ascii_hexdigit());
+    valid.then(|| format!("journalctl _SYSTEMD_INVOCATION_ID={invocation}"))
 }
 
 fn mutating_command(command: &Commands) -> Option<&'static str> {
@@ -412,15 +528,19 @@ fn format_cache_age(generated_at: chrono::DateTime<Utc>) -> String {
 }
 
 fn notify_test(config: &Config, text: &str, json: bool, environment_file: &Path) -> Result<()> {
-    let message = format!(
-        "zsnap TEST on {}\n{}",
-        notification::hostname(&config.notifications),
-        text
-    );
+    let notice = Notice {
+        headline: "zsnap webhook test".to_owned(),
+        host: notification::hostname(&config.notifications),
+        fields: vec![
+            NoticeField::text("Message", text),
+            NoticeField::text("Version", format!("zsnap {}", env!("CARGO_PKG_VERSION"))),
+        ],
+        ..Notice::default()
+    };
     let report = notification::deliver_with_environment_file(
         &config.notifications,
         DeliveryEvent::Test,
-        &message,
+        &notice,
         environment_file,
     )?;
     if json {
@@ -678,4 +798,70 @@ fn print_report(plan: &Plan, report: &ExecutionReport, json: bool, verbose: bool
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn notice_for(result: &Result<RunSummary>) -> (DeliveryEvent, Notice) {
+        let config = Config::parse("version = 1").unwrap();
+        run_notice(
+            "run",
+            &config,
+            Path::new("/etc/zsnap/zsnap.toml"),
+            Local::now(),
+            1.5,
+            result,
+        )
+    }
+
+    fn field<'a>(notice: &'a Notice, label: &str) -> &'a str {
+        &notice
+            .fields
+            .iter()
+            .find(|field| field.label == label)
+            .unwrap_or_else(|| panic!("missing {label} field"))
+            .value
+    }
+
+    #[test]
+    fn operation_failures_carry_every_error_and_progress() {
+        let result = Err(OperationsFailed {
+            errors: vec!["[tank] first".to_owned(), "[backup] second".to_owned()],
+            snapshots_created: 1,
+            snapshots_planned: 2,
+            snapshots_pruned: 0,
+            prunes_planned: 3,
+            prunes_skipped: 3,
+            pools: 2,
+        }
+        .into());
+        let (event, notice) = notice_for(&result);
+        assert_eq!(event, DeliveryEvent::Failure);
+        assert_eq!(notice.headline, "zsnap run failed");
+        assert_eq!(notice.details_heading, "Errors (2)");
+        assert_eq!(notice.details, ["[tank] first", "[backup] second"]);
+        assert_eq!(
+            field(&notice, "Snapshots"),
+            "created 1 of 2, pruned 0 of 3 across 2 pool(s); 3 prune(s) skipped after a snapshot failure"
+        );
+        assert_eq!(field(&notice, "Config"), "/etc/zsnap/zsnap.toml");
+    }
+
+    #[test]
+    fn early_failures_show_the_whole_cause_chain() {
+        let result = Err(anyhow!("Resource temporarily unavailable")
+            .context("failed to lock /run/zsnap/zsnap.lock"));
+        let (_, notice) = notice_for(&result);
+        assert_eq!(notice.details_heading, "Error");
+        assert_eq!(
+            notice.details,
+            [
+                "failed to lock /run/zsnap/zsnap.lock",
+                "caused by: Resource temporarily unavailable"
+            ]
+        );
+        assert!(notice.fields.iter().all(|field| field.label != "Snapshots"));
+    }
 }

@@ -429,6 +429,13 @@ Notifications are optional. Webhooks default to failure-only; add `"success"`
 when routine success messages are wanted. Flock and Slack receive their documented
 `text` payload, while Discord receives `content` with mention parsing disabled.
 
+Failure messages list each failed ZFS command or hook (including `zfs` stderr),
+snapshot and prune progress, the start time and duration, the config path, the
+zsnap version, and, under systemd, a `journalctl _SYSTEMD_INVOCATION_ID=…`
+command for that exact run. Discord and Slack get bold labels and a code block of
+errors; Flock gets plain text. When the error list does not fit in one message,
+the first errors are kept and the rest are counted.
+
 ```toml
 [notifications]
 max_parallel = 4
