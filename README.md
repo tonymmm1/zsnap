@@ -150,6 +150,15 @@ Additional guardrails:
 Requirements are Rust 1.89 or newer, a C linker/compiler for the bundled TLS crypto
 during compilation, and OpenZFS command-line tools at runtime.
 
+Debian 13 (trixie) packages Rust 1.85, which is too old. Install the newer
+toolchain from `trixie-backports` instead:
+
+```console
+echo 'deb http://deb.debian.org/debian trixie-backports main' | sudo tee /etc/apt/sources.list.d/trixie-backports.list
+sudo apt update
+sudo apt install -t trixie-backports cargo
+```
+
 ```console
 cargo build --release
 cargo test --all-targets
