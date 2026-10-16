@@ -396,14 +396,14 @@ fn invoke_zfs(
     result: &mut PoolResult,
 ) -> bool {
     let command = render_command(settings.zfs_command.as_os_str(), args);
-    if args.first().is_some_and(|argument| argument == "destroy") {
-        if let Err(reason) = validate_snapshot_destroy_command(args) {
-            result.errors.push(format!(
-                "[{}] refused unsafe ZFS destroy command {command}: {reason}",
-                result.pool
-            ));
-            return false;
-        }
+    if args.first().is_some_and(|argument| argument == "destroy")
+        && let Err(reason) = validate_snapshot_destroy_command(args)
+    {
+        result.errors.push(format!(
+            "[{}] refused unsafe ZFS destroy command {command}: {reason}",
+            result.pool
+        ));
+        return false;
     }
     if dry_run {
         result

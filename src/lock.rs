@@ -1,9 +1,8 @@
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
-use fs2::FileExt;
 
 pub struct RunLock {
     file: File,
@@ -22,17 +21,24 @@ impl RunLock {
             .write(true)
             .open(path)
             .with_context(|| format!("failed to open run lock {}", path.display()))?;
-        if let Err(error) = file.try_lock_exclusive() {
-            let mut holder = String::new();
-            let _ = file.read_to_string(&mut holder);
-            let holder = holder.trim();
-            if holder.is_empty() {
-                bail!("another zsnap process holds {}: {error}", path.display());
+        match file.try_lock() {
+            Ok(()) => {}
+            Err(TryLockError::WouldBlock) => {
+                let mut holder = String::new();
+                let _ = file.read_to_string(&mut holder);
+                let holder = holder.trim();
+                if holder.is_empty() {
+                    bail!("another zsnap process holds {}", path.display());
+                }
+                bail!(
+                    "another zsnap process (PID {holder}) holds {}",
+                    path.display()
+                );
             }
-            bail!(
-                "another zsnap process (PID {holder}) holds {}: {error}",
-                path.display()
-            );
+            Err(TryLockError::Error(error)) => {
+                return Err(error)
+                    .with_context(|| format!("failed to lock run lock {}", path.display()));
+            }
         }
         file.set_len(0)
             .with_context(|| format!("failed to truncate lock file {}", path.display()))?;
@@ -45,6 +51,31 @@ impl RunLock {
 
 impl Drop for RunLock {
     fn drop(&mut self) {
-        let _ = FileExt::unlock(&self.file);
+        let _ = self.file.unlock();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn second_acquire_reports_holder_until_released() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("run/zsnap.lock");
+
+        let first = RunLock::acquire(&path).unwrap();
+        let error = RunLock::acquire(&path).err().unwrap().to_string();
+        assert_eq!(
+            error,
+            format!(
+                "another zsnap process (PID {}) holds {}",
+                std::process::id(),
+                path.display()
+            )
+        );
+
+        drop(first);
+        RunLock::acquire(&path).unwrap();
     }
 }

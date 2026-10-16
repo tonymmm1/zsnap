@@ -570,13 +570,13 @@ fn set_hook(
 
 fn warn_ignored_structural(section_name: &str, section: &Section, warnings: &mut Vec<String>) {
     for key in ["path", "recursive", "use_template", "skip_children"] {
-        if let Some(entry) = section.get(key) {
-            if !entry.value.is_empty() {
-                warnings.push(format!(
+        if let Some(entry) = section.get(key)
+            && !entry.value.is_empty()
+        {
+            warnings.push(format!(
                     "[{section_name}] ignored structural setting {key:?} on line {}; Sanoid does not apply it from templates",
                     entry.line
                 ));
-            }
         }
     }
 }

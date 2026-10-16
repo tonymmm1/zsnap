@@ -15,7 +15,7 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@1.85.0
+      - uses: dtolnay/rust-toolchain@1.89.0
         with:
           components: clippy, rustfmt
           targets: x86_64-unknown-linux-musl

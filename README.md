@@ -147,7 +147,7 @@ Additional guardrails:
 
 ## Build
 
-Requirements are Rust 1.85 or newer, a C linker/compiler for the bundled TLS crypto
+Requirements are Rust 1.89 or newer, a C linker/compiler for the bundled TLS crypto
 during compilation, and OpenZFS command-line tools at runtime.
 
 ```console
@@ -172,8 +172,8 @@ For this checkout, whose Rust toolchain is managed by `mise`, the equivalent loc
 commands are:
 
 ```console
-mise exec rust@1.85.0 -- cargo build --release --locked
-mise exec rust@1.85.0 -- cargo test --all-targets --locked
+mise exec rust@1.89.0 -- cargo build --release --locked
+mise exec rust@1.89.0 -- cargo test --all-targets --locked
 # After uncommenting and naming at least one example dataset:
 ./target/release/zsnap --config ./config.example.toml check
 ```

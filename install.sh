@@ -151,7 +151,7 @@ if [ "$bootstrap_rust" -eq 1 ] && ! command -v rustup >/dev/null 2>&1; then
   rustup_installer=$(mktemp "${TMPDIR:-/tmp}/zsnap-rustup.XXXXXX")
   trap 'rm -f "$rustup_installer"' 0 HUP INT TERM
   curl --proto '=https' --tlsv1.2 -sSf -o "$rustup_installer" https://sh.rustup.rs
-  sh "$rustup_installer" -y --profile minimal --default-toolchain 1.85.0
+  sh "$rustup_installer" -y --profile minimal --default-toolchain 1.89.0
   rm -f "$rustup_installer"
   trap - 0 HUP INT TERM
   rustup_environment="${CARGO_HOME:-${HOME:-/root}/.cargo}/env"
