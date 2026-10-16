@@ -8,13 +8,13 @@ use std::thread;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
-use rayon::prelude::*;
 use serde::Serialize;
 
 use crate::config::{
     Notifications, WebhookConfig, WebhookEvent, WebhookKind, is_portable_environment_name,
     validate_webhook_url,
 };
+use crate::parallel::map_bounded;
 
 const MAX_MESSAGE_CHARACTERS: usize = 1_900;
 const MAX_DETAIL_CHARACTERS: usize = 500;
@@ -186,12 +186,6 @@ fn deliver_with_policy(
         });
     }
 
-    let thread_count = config.max_parallel.min(selected.len()).max(1);
-    let pool = rayon::ThreadPoolBuilder::new()
-        .num_threads(thread_count)
-        .thread_name(|index| format!("zsnap-webhook-{index}"))
-        .build()
-        .context("failed to create the webhook delivery thread set")?;
     let agent: ureq::Agent = ureq::Agent::config_builder()
         .timeout_global(Some(Duration::from_secs(config.timeout_seconds)))
         .https_only(transport_policy.https_only())
@@ -200,21 +194,17 @@ fn deliver_with_policy(
         .build()
         .into();
 
-    let mut deliveries = pool.install(|| {
-        selected
-            .into_par_iter()
-            .map(|webhook| {
-                deliver_one(
-                    &agent,
-                    config,
-                    webhook,
-                    &render(webhook.kind, event, notice),
-                    transport_policy,
-                    file_environment,
-                )
-            })
-            .collect::<Vec<_>>()
-    });
+    let mut deliveries = map_bounded(selected, config.max_parallel, "zsnap-webhook", |webhook| {
+        deliver_one(
+            &agent,
+            config,
+            webhook,
+            &render(webhook.kind, event, notice),
+            transport_policy,
+            file_environment,
+        )
+    })
+    .context("failed to create the webhook delivery thread set")?;
     deliveries.sort_by(|left, right| left.target.cmp(&right.target));
     let delivered = deliveries
         .iter()

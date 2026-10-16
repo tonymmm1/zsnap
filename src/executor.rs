@@ -5,10 +5,10 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use rayon::prelude::*;
 use serde::Serialize;
 
 use crate::config::Settings;
+use crate::parallel::map_bounded;
 use crate::planner::{Plan, PruneAction, SnapshotAction};
 use crate::zfs::MANAGED_PROPERTY;
 
@@ -86,17 +86,10 @@ pub fn execute(
     } else {
         settings.max_parallel_pools.min(work.len())
     };
-    let pool = rayon::ThreadPoolBuilder::new()
-        .num_threads(thread_count.max(1))
-        .thread_name(|index| format!("zsnap-pool-{index}"))
-        .build()
-        .context("failed to create the pool execution thread set")?;
-
-    let mut results = pool.install(|| {
-        work.into_par_iter()
-            .map(|pool_work| execute_pool(pool_work, settings, dry_run, verbose))
-            .collect::<Vec<_>>()
-    });
+    let mut results = map_bounded(work, thread_count, "zsnap-pool", |pool_work| {
+        execute_pool(pool_work, settings, dry_run, verbose)
+    })
+    .context("failed to create the pool execution thread set")?;
     results.sort_by(|left, right| left.pool.cmp(&right.pool));
 
     let mut report = ExecutionReport {

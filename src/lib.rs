@@ -4,6 +4,7 @@ pub mod lock;
 pub mod migration;
 pub mod model;
 pub mod notification;
+mod parallel;
 pub mod planner;
 pub mod status;
 pub mod zfs;
