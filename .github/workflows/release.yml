@@ -17,7 +17,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.85.0
         with:
           components: clippy, rustfmt
@@ -54,7 +54,7 @@ jobs:
             nfpm-arch: arm64
     name: ${{ matrix.target }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.85.0
         with:
           targets: ${{ matrix.target }}
@@ -99,7 +99,7 @@ jobs:
             "${{ matrix.target }}" \
             "${RELEASE_TAG#v}" \
             "${{ matrix.package-arch }}"
-      - uses: actions/upload-artifact@v6
+      - uses: actions/upload-artifact@v7
         with:
           name: release-${{ matrix.target }}
           path: dist/*
