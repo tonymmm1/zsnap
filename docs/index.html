@@ -796,7 +796,8 @@
           </p>
           <ul class="safety-list">
             <li><code>plan</code> and dry runs never mutate ZFS or execute hooks.</li>
-            <li>A failed snapshot or hook stops pruning for that pool.</li>
+            <li>A failed snapshot is reported but never blocks pruning, so a full pool can recover.</li>
+            <li>A hung <code>zfs</code> command times out instead of stalling every later run.</li>
             <li>User-held and clone-dependent snapshots are automatically protected.</li>
             <li>A process-wide lock prevents scheduled and manual runs from overlapping.</li>
           </ul>

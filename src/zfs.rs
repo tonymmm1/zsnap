@@ -1,11 +1,13 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::ffi::{OsStr, OsString};
+use std::ffi::OsString;
 use std::path::Path;
 use std::process::{Command, Output};
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 
 use crate::config::Settings;
+use crate::process::output_with_timeout;
 
 pub const MANAGED_PROPERTY: &str = "org.zsnap:managed";
 
@@ -50,6 +52,16 @@ impl Inventory {
             .map(|dataset| Self::pool_for_dataset(dataset))
             .map(str::to_owned)
             .collect();
+        // `zfs list -r` already covers descendants, so passing a nested section as well
+        // would make ZFS traverse that subtree a second time.
+        let roots: Vec<&String> = configured_datasets
+            .iter()
+            .filter(|dataset| {
+                !configured_datasets
+                    .iter()
+                    .any(|ancestor| is_descendant(dataset, ancestor))
+            })
+            .collect();
         let mut dataset_args: Vec<OsString> = vec![
             "list".into(),
             "-H".into(),
@@ -58,10 +70,12 @@ impl Inventory {
             "-t".into(),
             "filesystem,volume".into(),
             "-o".into(),
-            "name".into(),
+            format!("name,{MANAGED_PROPERTY}").into(),
         ];
-        dataset_args.extend(configured_datasets.iter().map(OsString::from));
-        let datasets_output = run_dataset_list_checked(&settings.zfs_command, &dataset_args)?;
+        dataset_args.extend(roots.iter().map(OsString::from));
+        let timeout = settings.zfs_timeout();
+        let datasets_output =
+            run_dataset_list_checked(&settings.zfs_command, &dataset_args, timeout)?;
         let mut snapshot_args: Vec<OsString> = vec![
             "list".into(),
             "-H".into(),
@@ -72,8 +86,8 @@ impl Inventory {
             "-o".into(),
             format!("name,creation,{MANAGED_PROPERTY},userrefs,clones").into(),
         ];
-        snapshot_args.extend(configured_datasets.into_iter().map(OsString::from));
-        let snapshots_output = run_checked(&settings.zfs_command, &snapshot_args)?;
+        snapshot_args.extend(roots.iter().map(OsString::from));
+        let snapshots_output = run_checked(&settings.zfs_command, &snapshot_args, timeout)?;
         let mut pool_args: Vec<OsString> = vec![
             "list".into(),
             "-H".into(),
@@ -82,10 +96,21 @@ impl Inventory {
             "name,capacity".into(),
         ];
         pool_args.extend(configured_pools.into_iter().map(OsString::from));
-        let pools_output = run_checked(&settings.zpool_command, &pool_args)?;
+        let pools_output = run_checked(&settings.zpool_command, &pool_args, timeout)?;
+
+        let datasets = parse_datasets(&String::from_utf8_lossy(&datasets_output.stdout))?;
+        // Nested sections are not passed to ZFS, so it cannot report them missing.
+        let missing: BTreeSet<String> = configured_datasets
+            .iter()
+            .filter(|dataset| !datasets.contains(*dataset))
+            .cloned()
+            .collect();
+        if !missing.is_empty() {
+            return Err(missing_datasets_error(missing));
+        }
 
         Ok(Self {
-            datasets: parse_datasets(&String::from_utf8_lossy(&datasets_output.stdout))?,
+            datasets,
             snapshots: parse_snapshots(&String::from_utf8_lossy(&snapshots_output.stdout))?,
             pools: parse_pools(&String::from_utf8_lossy(&pools_output.stdout))?,
         })
@@ -96,53 +121,66 @@ impl Inventory {
     }
 }
 
-pub fn run_checked<I, S>(program: &Path, args: I) -> Result<Output>
-where
-    I: IntoIterator<Item = S>,
-    S: AsRef<OsStr>,
-{
-    let args: Vec<OsString> = args
-        .into_iter()
-        .map(|arg| arg.as_ref().to_owned())
-        .collect();
-    let output = run_output(program, &args)?;
-    check_output(program, &args, output)
+fn run_checked(program: &Path, args: &[OsString], timeout: Option<Duration>) -> Result<Output> {
+    let output = run_output(program, args, timeout)?;
+    check_output(program, args, output)
 }
 
-fn run_dataset_list_checked(program: &Path, args: &[OsString]) -> Result<Output> {
-    let output = run_output(program, args)?;
+fn run_dataset_list_checked(
+    program: &Path,
+    args: &[OsString],
+    timeout: Option<Duration>,
+) -> Result<Output> {
+    let output = run_output(program, args, timeout)?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         if let Some(missing) = parse_missing_datasets(&stderr) {
-            let list = missing
-                .into_iter()
-                .map(|dataset| format!("  - {dataset}"))
-                .collect::<Vec<_>>()
-                .join("\n");
-            bail!(
-                "configured ZFS dataset sections reference missing names:\n{list}\ncorrect or remove these sections, then rerun `zsnap check --probe`"
-            );
+            return Err(missing_datasets_error(missing));
         }
     }
     check_output(program, args, output)
 }
 
-fn run_output(program: &Path, args: &[OsString]) -> Result<Output> {
-    let output = Command::new(program)
-        .args(args)
-        .env("LC_ALL", "C")
-        .output()
+fn missing_datasets_error(missing: BTreeSet<String>) -> anyhow::Error {
+    let list = missing
+        .into_iter()
+        .map(|dataset| format!("  - {dataset}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    anyhow::anyhow!(
+        "configured ZFS dataset sections reference missing names:\n{list}\ncorrect or remove these sections, then rerun `zsnap check --probe`"
+    )
+}
+
+fn is_descendant(dataset: &str, ancestor: &str) -> bool {
+    dataset
+        .strip_prefix(ancestor)
+        .is_some_and(|rest| rest.starts_with('/'))
+}
+
+fn run_output(program: &Path, args: &[OsString], timeout: Option<Duration>) -> Result<Output> {
+    let output = output_with_timeout(Command::new(program).args(args).env("LC_ALL", "C"), timeout)
         .with_context(|| format!("failed to execute {}", program.display()))?;
-    Ok(output)
+    output.with_context(|| {
+        format!(
+            "{} {} timed out after {}s (settings.zfs_timeout)",
+            program.display(),
+            render_args(args),
+            timeout.unwrap_or_default().as_secs()
+        )
+    })
+}
+
+fn render_args(args: &[OsString]) -> String {
+    args.iter()
+        .map(|arg| arg.to_string_lossy())
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn check_output(program: &Path, args: &[OsString], output: Output) -> Result<Output> {
     if !output.status.success() {
-        let rendered_args = args
-            .iter()
-            .map(|arg| arg.to_string_lossy())
-            .collect::<Vec<_>>()
-            .join(" ");
+        let rendered_args = render_args(args);
         let stderr = String::from_utf8_lossy(&output.stderr);
         bail!(
             "{} {} failed with {}: {}",
@@ -172,19 +210,51 @@ fn parse_missing_datasets(stderr: &str) -> Option<BTreeSet<String>> {
     (!missing.is_empty()).then_some(missing)
 }
 
+/// Parses `zfs list -o name,org.zsnap:managed` for filesystems and volumes.
+///
+/// Snapshots inherit user properties from their dataset, so a marker set on a dataset
+/// would make every unmarked snapshot beneath it look zsnap-managed. That is refused
+/// outright rather than risk pruning snapshots zsnap did not create.
 pub fn parse_datasets(output: &str) -> Result<BTreeSet<String>> {
     let mut datasets = BTreeSet::new();
+    let mut marked: Vec<&str> = Vec::new();
     for (index, line) in output.lines().enumerate() {
-        let name = line.trim();
-        if name.is_empty() {
+        if line.trim().is_empty() {
             continue;
         }
-        if name.contains('@') || name.contains('\t') {
+        let Some((name, marker)) = line.split_once('\t') else {
+            bail!(
+                "invalid dataset listing on line {}: expected 2 tab-separated fields: {line:?}",
+                index + 1
+            );
+        };
+        if name.is_empty() || name.contains('@') || marker.contains('\t') {
             bail!("invalid dataset listing on line {}: {line:?}", index + 1);
+        }
+        // Report only the topmost marked datasets; the listing is parent-first.
+        if is_managed_value(marker) && !marked.iter().any(|parent| is_descendant(name, parent)) {
+            marked.push(name);
         }
         datasets.insert(name.to_owned());
     }
+    if !marked.is_empty() {
+        let list = marked
+            .iter()
+            .map(|dataset| format!("  - {dataset}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        bail!(
+            "the snapshot ownership marker {MANAGED_PROPERTY} is set on or inherited by dataset(s):\n{list}\nsnapshots inherit dataset properties, so unmarked snapshots there would look zsnap-managed and could be pruned; find where it is set with `zfs get -r -s local {MANAGED_PROPERTY} <pool>` and clear it with `zfs inherit {MANAGED_PROPERTY} <dataset>`"
+        );
+    }
     Ok(datasets)
+}
+
+fn is_managed_value(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "1" | "yes" | "true" | "on"
+    )
 }
 
 pub fn parse_snapshots(output: &str) -> Result<Vec<Snapshot>> {
@@ -215,10 +285,7 @@ pub fn parse_snapshots(output: &str) -> Result<Vec<Snapshot>> {
                 index + 1
             )
         })?;
-        let managed = matches!(
-            fields[2].trim().to_ascii_lowercase().as_str(),
-            "1" | "yes" | "true" | "on"
-        );
+        let managed = is_managed_value(fields[2]);
         let user_holds = fields[3].parse::<u64>().with_context(|| {
             format!(
                 "invalid snapshot userrefs count {:?} on line {}",
@@ -287,8 +354,9 @@ mod tests {
 
     #[test]
     fn parses_inventory_outputs() {
-        let datasets = parse_datasets("tank\ntank/data\nbackup\n").unwrap();
+        let datasets = parse_datasets("tank\t-\ntank/data\t-\nbackup\t-\n").unwrap();
         assert!(datasets.contains("tank/data"));
+        assert!(parse_datasets("tank\ntank/data\n").is_err());
 
         let snapshots = parse_snapshots(
             "tank/data@autosnap_2026-08-27_12:00:00_hourly\t1787832000\tyes\t1\ttank/clone-a,tank/clone-b\n\
@@ -305,6 +373,20 @@ mod tests {
 
         let pools = parse_pools("tank\t42%\nbackup\t7%\n").unwrap();
         assert_eq!(pools["tank"].capacity_percent, 42);
+    }
+
+    #[test]
+    fn refuses_an_ownership_marker_inherited_from_a_dataset() {
+        let error = parse_datasets(
+            "tank\t-\ntank/data\tyes\ntank/data/db\tyes\ntank/database\t-\ntank/vm\ton\n",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("  - tank/data\n  - tank/vm\n"), "{error}");
+        assert!(!error.contains("tank/data/db"), "{error}");
+        assert!(error.contains("zfs inherit org.zsnap:managed"), "{error}");
+        // A non-marker value on a dataset cannot make snapshots look managed.
+        assert!(parse_datasets("tank\tno\n").is_ok());
     }
 
     #[test]

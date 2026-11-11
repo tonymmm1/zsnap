@@ -130,7 +130,6 @@ struct OperationsFailed {
     snapshots_planned: usize,
     snapshots_pruned: usize,
     prunes_planned: usize,
-    prunes_skipped: usize,
     pools: usize,
 }
 
@@ -167,13 +166,17 @@ fn main() -> Result<()> {
         return migrate_sanoid(input, defaults.as_deref(), output.as_deref(), cli.json);
     }
 
-    let config = Config::load(&cli.config)?;
     let webhook_environment_file = notification::environment_file_for_config(&cli.config);
+    if let Commands::NotifyTest { message } = &cli.command {
+        // Webhooks can be tested before any dataset is configured, so only the
+        // notification settings are validated here.
+        let config = Config::read(&cli.config)?;
+        config.notifications.validate()?;
+        return notify_test(&config, message, cli.json, &webhook_environment_file);
+    }
+    let config = Config::load(&cli.config)?;
     if let Commands::Check { probe } = &cli.command {
         return check(&config, *probe, cli.json);
-    }
-    if let Commands::NotifyTest { message } = &cli.command {
-        return notify_test(&config, message, cli.json, &webhook_environment_file);
     }
     if let Commands::Status { refresh } = &cli.command {
         return show_status(&config, *refresh, cli.json, cli.verbose);
@@ -297,7 +300,6 @@ fn run_zfs_command(cli: &Cli, config: &Config) -> Result<RunSummary> {
             snapshots_planned: plan.snapshot_count(),
             snapshots_pruned: report.snapshots_pruned,
             prunes_planned: plan.prune_count(),
-            prunes_skipped: report.prunes_skipped_after_snapshot_failure,
             pools: plan.pools().len(),
         }
         .into());
@@ -349,7 +351,7 @@ fn run_notice(
             notice.headline = format!("zsnap {command} failed");
             notice.fields.push(NoticeField::text("Started", timing));
             if let Some(failed) = error.downcast_ref::<OperationsFailed>() {
-                let mut snapshots = format!(
+                let snapshots = format!(
                     "created {} of {}, pruned {} of {} across {} pool(s)",
                     failed.snapshots_created,
                     failed.snapshots_planned,
@@ -357,12 +359,6 @@ fn run_notice(
                     failed.prunes_planned,
                     failed.pools
                 );
-                if failed.prunes_skipped > 0 {
-                    snapshots.push_str(&format!(
-                        "; {} prune(s) skipped after a snapshot failure",
-                        failed.prunes_skipped
-                    ));
-                }
                 notice
                     .fields
                     .push(NoticeField::text("Snapshots", snapshots));
@@ -420,7 +416,8 @@ fn mutating_command(command: &Commands) -> Option<&'static str> {
 fn show_status(config: &Config, refresh: bool, json: bool, verbose: bool) -> Result<()> {
     let cache_path = &config.settings.cache_file;
     let (cache, source) = if refresh || !cache_path.exists() {
-        let _lock = RunLock::acquire(&config.settings.lock_file)?;
+        // No run lock here: this only reads ZFS, and the cache write is atomic, so a
+        // refresh must not make a scheduled run fail with "another zsnap process".
         let inventory_started = Instant::now();
         let inventory =
             Inventory::discover(&config.settings, config.datasets.keys().map(String::as_str))?;
@@ -791,12 +788,6 @@ fn print_report(plan: &Plan, report: &ExecutionReport, json: bool, verbose: bool
             plan.pools().len()
         );
     }
-    if report.prunes_skipped_after_snapshot_failure > 0 {
-        eprintln!(
-            "safety stop: skipped {} prune(s) after a snapshot failure",
-            report.prunes_skipped_after_snapshot_failure
-        );
-    }
     Ok(())
 }
 
@@ -833,7 +824,6 @@ mod tests {
             snapshots_planned: 2,
             snapshots_pruned: 0,
             prunes_planned: 3,
-            prunes_skipped: 3,
             pools: 2,
         }
         .into());
@@ -844,7 +834,7 @@ mod tests {
         assert_eq!(notice.details, ["[tank] first", "[backup] second"]);
         assert_eq!(
             field(&notice, "Snapshots"),
-            "created 1 of 2, pruned 0 of 3 across 2 pool(s); 3 prune(s) skipped after a snapshot failure"
+            "created 1 of 2, pruned 0 of 3 across 2 pool(s)"
         );
         assert_eq!(field(&notice, "Config"), "/etc/zsnap/zsnap.toml");
     }

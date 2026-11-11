@@ -60,6 +60,10 @@ in memory. For execution it:
 4. serializes commands within a pool by default, avoiding extra queueing and disk
    contention on the same vdevs.
 
+A multi-dataset `zfs snapshot` is all-or-nothing, so when a batch fails zsnap
+retries its targets one at a time: a single dataset that cannot be snapshotted (for
+example a `refreservation` without enough free space) costs only its own snapshot.
+
 Hooks require dataset-specific ordering, so a dataset with hooks is automatically
 removed from batching. `max_parallel_pools = 0` means all pools may run at once;
 set a positive number to cap that concurrency.
@@ -78,7 +82,8 @@ settings control separate workloads and do not multiply ZFS writes:
 | `settings.max_parallel_pools` | `0` | `0` runs every independent pool concurrently. Keep it for roughly 1-4 pools; use `2` or `4` on hosts with many pools or shared controllers. |
 | `settings.snapshot_batch_size` | `128` | Maximum distinct dataset targets in one ZFS command; valid range `1..=256`. OpenZFS requires separate commands for multiple due names on one dataset. It does not add threads. |
 | `settings.prune_batch_size` | `64` | Maximum snapshot names destroyed per dataset command; valid range `1..=128`. It does not add threads. |
-| `settings.cache_file` | `/etc/zsnap/zsnap.cache` | Reporting-only JSON summary updated after successful mutating runs. It is never used to plan snapshots or pruning. |
+| `settings.cache_file` | `/var/lib/zsnap/zsnap.cache` | Reporting-only JSON summary updated after successful mutating runs. It is never used to plan snapshots or pruning. |
+| `settings.zfs_timeout` | `3600` | Seconds before a single `zfs` or `zpool` invocation is killed and reported as a failure, so a command hung on a suspended pool cannot stall every later run silently. `0` waits forever. Raise it only if one legitimate command takes longer on your pools. |
 | `notifications.max_parallel` | `4` | Maximum simultaneous HTTP requests, unrelated to pool concurrency. It matters only when more than four webhooks are configured. |
 | `notifications.timeout_seconds` | `10` | Whole-request deadline for each attempt. Increase only for a known slow internal relay. |
 | `notifications.max_attempts` | `3` | Total attempts for transient failures. Keep it low because the systemd job waits for delivery to finish. |
@@ -121,8 +126,14 @@ New snapshots receive the ZFS user property `org.zsnap:managed=yes`. By default,
 snapshots still count as recent snapshots when scheduling, preventing duplicates,
 but they are never deleted by `zsnap` because they lack its ownership marker.
 Managed snapshots with ZFS user holds (including Syncoid holds) or dependent clones
-are excluded from pruning and reported as protected; zsnap never uses deferred
-destroy to work around those protections.
+are excluded from pruning, and reported as protected once they have outlived their
+retention window; zsnap never uses deferred destroy to work around those protections.
+
+The marker belongs on snapshots only. ZFS snapshots inherit user properties from
+their dataset, so `zfs set org.zsnap:managed=yes pool/dataset` would make every
+unmarked snapshot beneath it look zsnap-managed. zsnap checks for this during
+discovery and refuses to plan or mutate anything until the property is cleared with
+`zfs inherit org.zsnap:managed pool/dataset`.
 
 Every generated `zfs destroy` command is checked again at the execution boundary.
 Only strict `dataset@snapshot[,snapshot...]` targets without flags are permitted;
@@ -136,8 +147,11 @@ Additional guardrails:
 
 - `plan` and `--dry-run` never mutate ZFS or execute hooks.
 - A locked run covers discovery, planning, snapshotting, and pruning.
-- If snapshot creation or a snapshot hook fails for a pool, all pruning for that
-  pool is skipped in the same run.
+- A failed snapshot or snapshot hook is reported as an error but does not stop
+  pruning. Retention never drops below its configured count, and on a full pool
+  pruning is what frees the space snapshots need to succeed again.
+- Every `zfs` and `zpool` invocation is bounded by `settings.zfs_timeout`, so a
+  hung command ends the run with a failure notification instead of blocking it.
 - A retention value is both an approximate age window and a minimum count. For
   example, `daily = 30` only prunes a daily older than 30 days when more than 30
   dailies exist.
@@ -408,7 +422,7 @@ version = 1
 snapshot_prefix = "autosnap"
 timezone = "local"
 max_parallel_pools = 0
-cache_file = "/etc/zsnap/zsnap.cache"
+cache_file = "/var/lib/zsnap/zsnap.cache"
 
 [template_production]
 autosnap = true
@@ -552,6 +566,10 @@ The hook environment contains `ZSNAP_SCRIPT`, `ZSNAP_TARGET`, `ZSNAP_TARGETS`,
 Equivalent `SANOID_*` variables are also set to ease hook migration. Set a hook to
 `["/bin/sh", "-c", "..."]` only when shell behavior is explicitly needed.
 
+Hook stdout is redirected to zsnap's stderr, so `--json` output stays parseable.
+Each hook runs in its own process group; when `script_timeout` expires the whole
+group is killed, including anything the hook started in the background.
+
 ## Commands
 
 ```console
@@ -596,7 +614,7 @@ preparation, not ZFS mutation speed.
 
 ### Cached status
 
-`zsnap status` normally reads `/etc/zsnap/zsnap.cache` without invoking `zfs` or
+`zsnap status` normally reads `/var/lib/zsnap/zsnap.cache` without invoking `zfs` or
 `zpool`. Its compact output reports configured zpools, recursively discovered
 datasets, total snapshots, and the subset carrying `org.zsnap:managed=yes`.
 `--verbose` adds counts for every pool and dataset; `--json` emits the same cached
@@ -607,7 +625,9 @@ holding the normal run lock. This means the installed systemd timer and the
 OpenRC/cron runner refresh it automatically without performing a second inventory
 scan. A failed operation leaves the previous cache intact. If the cache does not
 exist, `status` creates it from a live scan; `status --refresh` always forces a live
-scan. Writes use an adjacent mode-0600 temporary file, synchronization, and atomic
+scan. Neither takes the run lock, so checking status never makes a scheduled run fail. Releases up to
+0.1.3 defaulted to `/etc/zsnap/zsnap.cache`; a configuration that names that path
+keeps using it, and an orphaned file there can simply be deleted. Writes use an adjacent mode-0600 temporary file, synchronization, and atomic
 rename so readers never observe a partial document.
 
 The cache is deliberately reporting-only and scoped to configured roots plus their

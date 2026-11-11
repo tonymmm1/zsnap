@@ -26,9 +26,12 @@ prune_batch_size = 64
 
 lock_file = "/run/zsnap/zsnap.lock"
 # Reporting-only status summary. Snapshot and prune decisions never read this file.
-cache_file = "/etc/zsnap/zsnap.cache"
+cache_file = "/var/lib/zsnap/zsnap.cache"
 zfs_command = "zfs"
 zpool_command = "zpool"
+# Seconds before one zfs/zpool invocation is killed and reported as a failure, so a
+# command hung on a suspended pool cannot block every later run. 0 waits forever.
+zfs_timeout = 3600
 
 # Pruning is ownership-safe and is not configurable: only snapshots carrying
 # org.zsnap:managed=yes are eligible. Compatible unmarked names may prevent a

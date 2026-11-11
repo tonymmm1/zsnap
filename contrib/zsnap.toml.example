@@ -28,9 +28,11 @@ snapshot_batch_size = 128
 prune_batch_size = 64
 lock_file = "/run/zsnap/zsnap.lock"
 # Reporting only; never used for snapshot or prune decisions.
-cache_file = "/etc/zsnap/zsnap.cache"
+cache_file = "/var/lib/zsnap/zsnap.cache"
 zfs_command = "zfs"
 zpool_command = "zpool"
+# Seconds before one zfs/zpool invocation is killed and reported; 0 waits forever.
+zfs_timeout = 3600
 
 [notifications]
 enabled = false

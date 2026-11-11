@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
@@ -253,6 +253,8 @@ impl StatusCache {
         result
     }
 
+    /// Rejects caches written in another format version. The file is only ever written
+    /// by zsnap itself, and `deny_unknown_fields` already catches structural damage.
     pub fn validate(&self) -> Result<()> {
         ensure!(
             self.version == STATUS_CACHE_VERSION,
@@ -260,95 +262,6 @@ impl StatusCache {
             self.version,
             STATUS_CACHE_VERSION
         );
-        let mut pool_names = BTreeSet::new();
-        for pool in &self.pools {
-            ensure!(
-                !pool.name.is_empty(),
-                "status cache contains an empty pool name"
-            );
-            ensure!(
-                pool_names.insert(pool.name.as_str()),
-                "status cache contains duplicate pool {:?}",
-                pool.name
-            );
-            ensure!(
-                pool.managed_snapshots <= pool.snapshots,
-                "status cache pool {:?} has more managed snapshots than snapshots",
-                pool.name
-            );
-            ensure!(
-                pool.capacity_percent.is_none_or(|capacity| capacity <= 100),
-                "status cache pool {:?} has an invalid capacity",
-                pool.name
-            );
-        }
-        let mut dataset_names = BTreeSet::new();
-        for dataset in &self.datasets {
-            ensure!(
-                !dataset.name.is_empty(),
-                "status cache contains an empty dataset name"
-            );
-            ensure!(
-                dataset_names.insert(dataset.name.as_str()),
-                "status cache contains duplicate dataset {:?}",
-                dataset.name
-            );
-            ensure!(
-                pool_names.contains(dataset.pool.as_str()),
-                "status cache dataset {:?} references missing pool {:?}",
-                dataset.name,
-                dataset.pool
-            );
-            ensure!(
-                Inventory::pool_for_dataset(&dataset.name) == dataset.pool,
-                "status cache dataset {:?} has inconsistent pool {:?}",
-                dataset.name,
-                dataset.pool
-            );
-            ensure!(
-                dataset.managed_snapshots <= dataset.snapshots,
-                "status cache dataset {:?} has more managed snapshots than snapshots",
-                dataset.name
-            );
-        }
-        let snapshots = self.datasets.iter().map(|dataset| dataset.snapshots).sum();
-        let managed_snapshots = self
-            .datasets
-            .iter()
-            .map(|dataset| dataset.managed_snapshots)
-            .sum();
-        ensure!(
-            self.totals
-                == (StatusTotals {
-                    pools: self.pools.len(),
-                    datasets: self.datasets.len(),
-                    snapshots,
-                    managed_snapshots,
-                }),
-            "status cache totals do not match its pool and dataset records"
-        );
-        for pool in &self.pools {
-            let datasets = self
-                .datasets
-                .iter()
-                .filter(|dataset| dataset.pool == pool.name)
-                .collect::<Vec<_>>();
-            ensure!(
-                pool.datasets == datasets.len()
-                    && pool.snapshots
-                        == datasets
-                            .iter()
-                            .map(|dataset| dataset.snapshots)
-                            .sum::<usize>()
-                    && pool.managed_snapshots
-                        == datasets
-                            .iter()
-                            .map(|dataset| dataset.managed_snapshots)
-                            .sum::<usize>(),
-                "status cache pool totals do not match dataset records for {:?}",
-                pool.name
-            );
-        }
         Ok(())
     }
 }

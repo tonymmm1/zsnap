@@ -119,20 +119,6 @@ pub struct NotificationDelivery {
     pub error: Option<String>,
 }
 
-pub fn deliver(
-    config: &Notifications,
-    event: DeliveryEvent,
-    notice: &Notice,
-) -> Result<NotificationReport> {
-    deliver_with_policy(
-        config,
-        event,
-        notice,
-        TransportPolicy::HttpsOnly,
-        &WebhookEnvironment::new(),
-    )
-}
-
 /// Return the conventional webhook environment file next to a zsnap config.
 pub fn environment_file_for_config(config_path: &Path) -> PathBuf {
     config_path
@@ -225,6 +211,8 @@ pub fn hostname(config: &Notifications) -> String {
     let detected = env::var("HOSTNAME")
         .ok()
         .filter(|value| !value.trim().is_empty())
+        // The kernel's current name; /etc/hostname is absent on some hosts.
+        .or_else(|| fs::read_to_string("/proc/sys/kernel/hostname").ok())
         .or_else(|| fs::read_to_string("/etc/hostname").ok())
         .unwrap_or_else(|| "unknown-host".to_owned());
     detected

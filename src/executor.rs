@@ -1,7 +1,8 @@
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
+use std::io;
+use std::os::unix::process::CommandExt;
 use std::process::{Command, Stdio};
-use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -10,6 +11,7 @@ use serde::Serialize;
 use crate::config::Settings;
 use crate::parallel::map_bounded;
 use crate::planner::{Plan, PruneAction, SnapshotAction};
+use crate::process::{output_with_timeout, wait_with_timeout};
 use crate::zfs::MANAGED_PROPERTY;
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -17,7 +19,6 @@ pub struct ExecutionReport {
     pub dry_run: bool,
     pub snapshots_created: usize,
     pub snapshots_pruned: usize,
-    pub prunes_skipped_after_snapshot_failure: usize,
     pub errors: Vec<String>,
     pub logs: Vec<String>,
 }
@@ -40,7 +41,6 @@ struct PoolResult {
     pool: String,
     snapshots_created: usize,
     snapshots_pruned: usize,
-    prunes_skipped: usize,
     errors: Vec<String>,
     logs: Vec<String>,
 }
@@ -86,11 +86,11 @@ pub fn execute(
     } else {
         settings.max_parallel_pools.min(work.len())
     };
-    let mut results = map_bounded(work, thread_count, "zsnap-pool", |pool_work| {
+    // Results come back in input order, which is already sorted by pool name.
+    let results = map_bounded(work, thread_count, "zsnap-pool", |pool_work| {
         execute_pool(pool_work, settings, dry_run, verbose)
     })
     .context("failed to create the pool execution thread set")?;
-    results.sort_by(|left, right| left.pool.cmp(&right.pool));
 
     let mut report = ExecutionReport {
         dry_run,
@@ -99,7 +99,6 @@ pub fn execute(
     for mut result in results {
         report.snapshots_created += result.snapshots_created;
         report.snapshots_pruned += result.snapshots_pruned;
-        report.prunes_skipped_after_snapshot_failure += result.prunes_skipped;
         report.errors.append(&mut result.errors);
         report.logs.append(&mut result.logs);
     }
@@ -118,7 +117,6 @@ fn execute_pool(work: PoolWork, settings: &Settings, dry_run: bool, verbose: boo
             .push(format!("[{}] starting pool work", work.pool));
     }
     let snapshot_started = Instant::now();
-    let mut snapshot_failed = false;
     let mut batchable_regular = Vec::new();
     let mut batchable_recursive = Vec::new();
     let mut hooked = Vec::new();
@@ -132,34 +130,15 @@ fn execute_pool(work: PoolWork, settings: &Settings, dry_run: bool, verbose: boo
         }
     }
 
-    snapshot_failed |=
-        !execute_snapshot_batches(&batchable_regular, false, settings, dry_run, &mut result);
-    snapshot_failed |=
-        !execute_snapshot_batches(&batchable_recursive, true, settings, dry_run, &mut result);
+    execute_snapshot_batches(&batchable_regular, false, settings, dry_run, &mut result);
+    execute_snapshot_batches(&batchable_recursive, true, settings, dry_run, &mut result);
     for action in hooked {
-        if !execute_hooked_snapshot(&action, settings, dry_run, &mut result) {
-            snapshot_failed = true;
-        }
+        execute_hooked_snapshot(&action, settings, dry_run, &mut result);
     }
     let snapshot_elapsed = snapshot_started.elapsed();
 
-    if snapshot_failed && !work.prunes.is_empty() {
-        result.prunes_skipped = work.prunes.iter().map(|action| action.names.len()).sum();
-        result.logs.push(format!(
-            "[{}] skipped {} prune(s) because snapshot creation or a snapshot hook failed",
-            work.pool, result.prunes_skipped
-        ));
-        if verbose {
-            result.logs.push(format!(
-                "[{}] timing: snapshots {:.3} ms, pruning skipped, pool total {:.3} ms",
-                work.pool,
-                snapshot_elapsed.as_secs_f64() * 1_000.0,
-                pool_started.elapsed().as_secs_f64() * 1_000.0
-            ));
-        }
-        return result;
-    }
-
+    // Pruning runs even when a snapshot failed. Retention never drops below its
+    // configured count, and on a full pool pruning is what lets snapshots succeed again.
     let prune_started = Instant::now();
     for action in work.prunes {
         if action.policy.has_prune_hooks() {
@@ -181,14 +160,24 @@ fn execute_pool(work: PoolWork, settings: &Settings, dry_run: bool, verbose: boo
     result
 }
 
+fn snapshot_args(recursive: bool, targets: &[String]) -> Vec<OsString> {
+    let mut args: Vec<OsString> = vec![OsString::from("snapshot")];
+    if recursive {
+        args.push(OsString::from("-r"));
+    }
+    args.push(OsString::from("-o"));
+    args.push(OsString::from(format!("{MANAGED_PROPERTY}=yes")));
+    args.extend(targets.iter().map(OsString::from));
+    args
+}
+
 fn execute_snapshot_batches(
     actions: &[SnapshotAction],
     recursive: bool,
     settings: &Settings,
     dry_run: bool,
     result: &mut PoolResult,
-) -> bool {
-    let mut succeeded = true;
+) {
     let round_count = actions
         .iter()
         .map(|action| action.names.len())
@@ -209,21 +198,30 @@ fn execute_snapshot_batches(
             })
             .collect::<Vec<_>>();
         for chunk in targets.chunks(settings.snapshot_batch_size) {
-            let mut args: Vec<OsString> = vec![OsString::from("snapshot")];
-            if recursive {
-                args.push(OsString::from("-r"));
-            }
-            args.push(OsString::from("-o"));
-            args.push(OsString::from(format!("{MANAGED_PROPERTY}=yes")));
-            args.extend(chunk.iter().map(OsString::from));
-            if invoke_zfs(settings, &args, dry_run, result) {
-                result.snapshots_created += chunk.len();
-            } else {
-                succeeded = false;
+            match run_zfs(settings, &snapshot_args(recursive, chunk), dry_run, result) {
+                Ok(()) => result.snapshots_created += chunk.len(),
+                // A multi-target snapshot is all-or-nothing, so one dataset that cannot
+                // be snapshotted fails the whole batch. Retry each target on its own so
+                // only that dataset is affected.
+                Err(failure) if failure.exited && chunk.len() > 1 => {
+                    result.logs.push(format!(
+                        "[{}] snapshot batch failed; retrying its {} target(s) individually: {}",
+                        result.pool,
+                        chunk.len(),
+                        failure.message
+                    ));
+                    for target in chunk {
+                        let args = snapshot_args(recursive, std::slice::from_ref(target));
+                        match run_zfs(settings, &args, dry_run, result) {
+                            Ok(()) => result.snapshots_created += 1,
+                            Err(failure) => result.errors.push(failure.message),
+                        }
+                    }
+                }
+                Err(failure) => result.errors.push(failure.message),
             }
         }
     }
-    succeeded
 }
 
 fn execute_hooked_snapshot(
@@ -231,7 +229,7 @@ fn execute_hooked_snapshot(
     settings: &Settings,
     dry_run: bool,
     result: &mut PoolResult,
-) -> bool {
+) {
     let types = action
         .kinds
         .iter()
@@ -263,42 +261,16 @@ fn execute_hooked_snapshot(
             "[{}] pre-snapshot hook failed for {}; snapshot skipped",
             action.pool, action.dataset
         ));
-        if action.policy.force_post_snapshot_script
-            && !action.policy.post_snapshot_script.is_empty()
-        {
-            let environment = HookEnvironment {
-                script: "post",
-                pre_failure: true,
-                ..environment
-            };
-            run_hook(
-                &action.policy.post_snapshot_script,
-                action.policy.script_timeout,
-                &environment,
-                dry_run,
-                result,
-            );
-        }
-        return false;
-    }
-
-    let mut snapshot_succeeded = true;
-    for name in &action.names {
-        let mut args: Vec<OsString> = vec![OsString::from("snapshot")];
-        if action.recursive {
-            args.push(OsString::from("-r"));
-        }
-        args.push(OsString::from("-o"));
-        args.push(OsString::from(format!("{MANAGED_PROPERTY}=yes")));
-        args.push(OsString::from(format!("{}@{name}", action.dataset)));
-        if invoke_zfs(settings, &args, dry_run, result) {
-            result.snapshots_created += 1;
-        } else {
-            snapshot_succeeded = false;
+    } else {
+        for name in &action.names {
+            let target = format!("{}@{name}", action.dataset);
+            let args = snapshot_args(action.recursive, std::slice::from_ref(&target));
+            if invoke_zfs(settings, &args, dry_run, result) {
+                result.snapshots_created += 1;
+            }
         }
     }
 
-    let mut post_succeeded = true;
     if !action.policy.post_snapshot_script.is_empty()
         && (pre_succeeded || action.policy.force_post_snapshot_script)
     {
@@ -307,7 +279,7 @@ fn execute_hooked_snapshot(
             pre_failure: !pre_succeeded,
             ..environment
         };
-        post_succeeded = run_hook(
+        run_hook(
             &action.policy.post_snapshot_script,
             action.policy.script_timeout,
             &environment,
@@ -315,7 +287,6 @@ fn execute_hooked_snapshot(
             result,
         );
     }
-    pre_succeeded && snapshot_succeeded && post_succeeded
 }
 
 fn execute_prune_batches(
@@ -382,47 +353,78 @@ fn execute_hooked_prunes(
     }
 }
 
+/// Why a ZFS command did not succeed. `exited` is true only when the command ran to
+/// completion and reported failure itself, which is the one case worth retrying.
+struct ZfsFailure {
+    message: String,
+    exited: bool,
+}
+
 fn invoke_zfs(
     settings: &Settings,
     args: &[OsString],
     dry_run: bool,
     result: &mut PoolResult,
 ) -> bool {
+    match run_zfs(settings, args, dry_run, result) {
+        Ok(()) => true,
+        Err(failure) => {
+            result.errors.push(failure.message);
+            false
+        }
+    }
+}
+
+fn run_zfs(
+    settings: &Settings,
+    args: &[OsString],
+    dry_run: bool,
+    result: &mut PoolResult,
+) -> Result<(), ZfsFailure> {
     let command = render_command(settings.zfs_command.as_os_str(), args);
+    let failure = |message: String, exited: bool| ZfsFailure { message, exited };
     if args.first().is_some_and(|argument| argument == "destroy")
         && let Err(reason) = validate_snapshot_destroy_command(args)
     {
-        result.errors.push(format!(
-            "[{}] refused unsafe ZFS destroy command {command}: {reason}",
-            result.pool
+        return Err(failure(
+            format!(
+                "[{}] refused unsafe ZFS destroy command {command}: {reason}",
+                result.pool
+            ),
+            false,
         ));
-        return false;
     }
     if dry_run {
         result
             .logs
             .push(format!("[{}] WOULD RUN {command}", result.pool));
-        return true;
+        return Ok(());
     }
     result.logs.push(format!("[{}] RUN {command}", result.pool));
-    match Command::new(&settings.zfs_command).args(args).output() {
-        Ok(output) if output.status.success() => true,
-        Ok(output) => {
-            result.errors.push(format!(
+    let timeout = settings.zfs_timeout();
+    match output_with_timeout(Command::new(&settings.zfs_command).args(args), timeout) {
+        Ok(Some(output)) if output.status.success() => Ok(()),
+        Ok(Some(output)) => Err(failure(
+            format!(
                 "[{}] {command} failed with {}: {}",
                 result.pool,
                 output.status,
                 String::from_utf8_lossy(&output.stderr).trim()
-            ));
-            false
-        }
-        Err(error) => {
-            result.errors.push(format!(
-                "[{}] failed to execute {command}: {error}",
-                result.pool
-            ));
-            false
-        }
+            ),
+            true,
+        )),
+        Ok(None) => Err(failure(
+            format!(
+                "[{}] {command} timed out after {}s (settings.zfs_timeout)",
+                result.pool,
+                timeout.unwrap_or_default().as_secs()
+            ),
+            false,
+        )),
+        Err(error) => Err(failure(
+            format!("[{}] failed to execute {command}: {error}", result.pool),
+            false,
+        )),
     }
 }
 
@@ -514,8 +516,11 @@ fn run_hook(
             if environment.pre_failure { "1" } else { "0" },
         )
         .stdin(Stdio::null())
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit());
+        // stdout is reserved for zsnap's own report, which may be JSON.
+        .stdout(io::stderr())
+        .stderr(Stdio::inherit())
+        // Own process group, so a timeout also kills whatever the hook started.
+        .process_group(0);
     let mut child = match process.spawn() {
         Ok(child) => child,
         Err(error) => {
@@ -526,37 +531,30 @@ fn run_hook(
             return false;
         }
     };
-    let deadline =
-        (timeout_seconds > 0).then(|| Instant::now() + Duration::from_secs(timeout_seconds));
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) if status.success() => return true,
-            Ok(Some(status)) => {
-                result.errors.push(format!(
-                    "[{}] hook {rendered} failed with {status}",
-                    result.pool
-                ));
-                return false;
-            }
-            Ok(None) => {}
-            Err(error) => {
-                result.errors.push(format!(
-                    "[{}] failed while waiting for hook {rendered}: {error}",
-                    result.pool
-                ));
-                return false;
-            }
+    let timeout = (timeout_seconds > 0).then(|| Duration::from_secs(timeout_seconds));
+    match wait_with_timeout(&mut child, timeout) {
+        Ok(Some(status)) if status.success() => true,
+        Ok(Some(status)) => {
+            result.errors.push(format!(
+                "[{}] hook {rendered} failed with {status}",
+                result.pool
+            ));
+            false
         }
-        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
-            let _ = child.kill();
-            let _ = child.wait();
+        Ok(None) => {
             result.errors.push(format!(
                 "[{}] hook {rendered} timed out after {timeout_seconds}s",
                 result.pool
             ));
-            return false;
+            false
         }
-        thread::sleep(Duration::from_millis(25));
+        Err(error) => {
+            result.errors.push(format!(
+                "[{}] failed while waiting for hook {rendered}: {error}",
+                result.pool
+            ));
+            false
+        }
     }
 }
 
@@ -576,26 +574,50 @@ where
 #[cfg(test)]
 mod tests {
     use std::fs;
-    use std::os::unix::fs::PermissionsExt;
+    use std::io::Write;
+    use std::path::Path;
 
     use tempfile::tempdir;
 
     use super::*;
     use crate::config::Policy;
 
+    /// Writes an executable script through a child process. Writing it from the test
+    /// process would briefly hold a writable descriptor that a concurrently forking
+    /// test can inherit, making the script fail to execute with ETXTBSY.
+    fn write_script(path: &Path, contents: &str) {
+        let mut writer = Command::new("/bin/sh")
+            .args(["-c", "cat > \"$1\" && chmod 755 \"$1\"", "sh"])
+            .arg(path)
+            .stdin(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut stdin = writer.stdin.take().unwrap();
+        stdin.write_all(contents.as_bytes()).unwrap();
+        drop(stdin);
+        assert!(writer.wait().unwrap().success());
+    }
+
+    fn snapshot_action(dataset: &str, name: &str, policy: &Policy) -> SnapshotAction {
+        SnapshotAction {
+            pool: "tank".to_owned(),
+            dataset: dataset.to_owned(),
+            recursive: false,
+            names: vec![name.to_owned()],
+            kinds: vec![],
+            policy: policy.clone(),
+        }
+    }
+
     #[test]
     fn batches_snapshot_targets_into_one_command() {
         let directory = tempdir().unwrap();
         let script = directory.path().join("fake-zfs");
         let log = directory.path().join("calls.log");
-        fs::write(
+        write_script(
             &script,
-            format!("#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\n", log.display()),
-        )
-        .unwrap();
-        let mut permissions = fs::metadata(&script).unwrap().permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(&script, permissions).unwrap();
+            &format!("#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\n", log.display()),
+        );
 
         let settings = Settings {
             zfs_command: script,
@@ -674,14 +696,10 @@ mod tests {
         let directory = tempdir().unwrap();
         let script = directory.path().join("fake-zfs");
         let log = directory.path().join("calls.log");
-        fs::write(
+        write_script(
             &script,
-            format!("#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\n", log.display()),
-        )
-        .unwrap();
-        let mut permissions = fs::metadata(&script).unwrap().permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(&script, permissions).unwrap();
+            &format!("#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\n", log.display()),
+        );
 
         let settings = Settings {
             zfs_command: script,
@@ -736,14 +754,10 @@ mod tests {
         let directory = tempdir().unwrap();
         let script = directory.path().join("fake-zfs");
         let log = directory.path().join("calls.log");
-        fs::write(
+        write_script(
             &script,
-            format!("#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\n", log.display()),
-        )
-        .unwrap();
-        let mut permissions = fs::metadata(&script).unwrap().permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(&script, permissions).unwrap();
+            &format!("#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\n", log.display()),
+        );
 
         let settings = Settings {
             zfs_command: script,
@@ -823,10 +837,7 @@ mod tests {
         let directory = tempdir().unwrap();
         let script = directory.path().join("fake-zfs");
         let marker = directory.path().join("executed");
-        fs::write(&script, format!("#!/bin/sh\n: > '{}'\n", marker.display())).unwrap();
-        let mut permissions = fs::metadata(&script).unwrap().permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(&script, permissions).unwrap();
+        write_script(&script, &format!("#!/bin/sh\n: > '{}'\n", marker.display()));
 
         let settings = Settings {
             zfs_command: script,
@@ -849,14 +860,10 @@ mod tests {
         let directory = tempdir().unwrap();
         let script = directory.path().join("fake-zfs");
         let log = directory.path().join("calls.log");
-        fs::write(
+        write_script(
             &script,
-            format!("#!/bin/sh\nprintf '%s\\n' \"$1\" >> '{}'\n", log.display()),
-        )
-        .unwrap();
-        let mut permissions = fs::metadata(&script).unwrap().permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(&script, permissions).unwrap();
+            &format!("#!/bin/sh\nprintf '%s\\n' \"$1\" >> '{}'\n", log.display()),
+        );
 
         let long_suffix = "x".repeat(200);
         let snapshot_names = (0..3)
@@ -902,48 +909,218 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_failure_stops_pruning_for_that_pool() {
+    fn snapshot_failure_does_not_block_pruning() {
+        let directory = tempdir().unwrap();
+        let script = directory.path().join("fake-zfs");
+        let log = directory.path().join("calls.log");
+        write_script(
+            &script,
+            &format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$1\" >> '{}'\nif [ \"$1\" = snapshot ]; then echo 'out of space' >&2; exit 1; fi\n",
+                log.display()
+            ),
+        );
         let settings = Settings {
-            zfs_command: "false".into(),
+            zfs_command: script,
             ..Settings::default()
         };
         let policy = Policy::default();
         let plan = Plan {
-            snapshots: vec![SnapshotAction {
-                pool: "tank".to_owned(),
-                dataset: "tank/data".to_owned(),
-                recursive: false,
-                names: vec!["autosnap_2026-08-27_12:00:00_hourly".to_owned()],
-                kinds: vec![crate::model::SnapshotKind::Hourly],
-                policy: policy.clone(),
-            }],
+            snapshots: vec![snapshot_action("tank/data", "autosnap_new_hourly", &policy)],
             prunes: vec![PruneAction {
                 pool: "tank".to_owned(),
                 dataset: "tank/data".to_owned(),
-                names: vec!["autosnap_2026-08-20_12:00:00_hourly".to_owned()],
+                names: vec!["autosnap_old_hourly".to_owned()],
                 policy,
             }],
             ..Plan::default()
         };
         let report = execute(&plan, &settings, false, false).unwrap();
-        assert!(!report.succeeded());
-        assert_eq!(report.prunes_skipped_after_snapshot_failure, 1);
-        assert_eq!(report.snapshots_pruned, 0);
-        let commands = report
-            .logs
-            .iter()
-            .filter(|log| log.contains("] RUN "))
-            .collect::<Vec<_>>();
-        assert_eq!(commands.len(), 1);
-        assert!(commands[0].contains(" RUN \"false\" \"snapshot\" "));
-        assert!(
-            report
-                .logs
-                .iter()
-                .any(|log| log.contains("skipped 1 prune"))
+        assert_eq!(report.errors.len(), 1, "{:?}", report.errors);
+        assert!(report.errors[0].contains("out of space"));
+        assert_eq!(report.snapshots_created, 0);
+        assert_eq!(report.snapshots_pruned, 1);
+        let calls = fs::read_to_string(log).unwrap();
+        assert_eq!(calls.lines().collect::<Vec<_>>(), ["snapshot", "destroy"]);
+    }
+
+    #[test]
+    fn a_failed_snapshot_batch_is_retried_one_dataset_at_a_time() {
+        let directory = tempdir().unwrap();
+        let script = directory.path().join("fake-zfs");
+        let log = directory.path().join("calls.log");
+        // Like ZFS, fail the whole command when any one target cannot be snapshotted.
+        write_script(
+            &script,
+            &format!(
+                "#!/bin/sh\ncase \"$*\" in *tank/bad@*) echo 'out of space' >&2; exit 1 ;; esac\nshift 3\nprintf '%s\\n' \"$@\" >> '{}'\n",
+                log.display()
+            ),
         );
-        assert_eq!(report.errors.len(), 1);
-        assert!(report.errors[0].contains("failed with"));
+        let settings = Settings {
+            zfs_command: script,
+            ..Settings::default()
+        };
+        let policy = Policy::default();
+        let plan = Plan {
+            snapshots: vec![
+                snapshot_action("tank/a", "autosnap_a_hourly", &policy),
+                snapshot_action("tank/bad", "autosnap_bad_hourly", &policy),
+                snapshot_action("tank/c", "autosnap_c_hourly", &policy),
+            ],
+            ..Plan::default()
+        };
+        let report = execute(&plan, &settings, false, false).unwrap();
+        assert_eq!(report.snapshots_created, 2);
+        assert_eq!(report.errors.len(), 1, "{:?}", report.errors);
+        assert!(report.errors[0].contains("tank/bad@autosnap_bad_hourly"));
+        assert!(!report.errors[0].contains("tank/a@"));
+        let created = fs::read_to_string(log).unwrap();
+        assert_eq!(
+            created.lines().collect::<Vec<_>>(),
+            ["tank/a@autosnap_a_hourly", "tank/c@autosnap_c_hourly"]
+        );
+    }
+
+    #[test]
+    fn a_zfs_command_that_never_returns_times_out() {
+        let directory = tempdir().unwrap();
+        let script = directory.path().join("fake-zfs");
+        write_script(&script, "#!/bin/sh\nexec sleep 60\n");
+        let settings = Settings {
+            zfs_command: script,
+            zfs_timeout: 1,
+            ..Settings::default()
+        };
+        let policy = Policy::default();
+        let plan = Plan {
+            snapshots: vec![
+                snapshot_action("tank/a", "autosnap_a_hourly", &policy),
+                snapshot_action("tank/b", "autosnap_b_hourly", &policy),
+            ],
+            ..Plan::default()
+        };
+        let started = Instant::now();
+        let report = execute(&plan, &settings, false, false).unwrap();
+        // One timeout for the batch; a timed-out batch is not retried per dataset.
+        assert!(started.elapsed() < Duration::from_secs(20));
+        assert_eq!(report.errors.len(), 1, "{:?}", report.errors);
+        assert!(report.errors[0].contains("timed out after 1s"));
+        assert_eq!(report.snapshots_created, 0);
+    }
+
+    fn shell_hook(script: String) -> Vec<String> {
+        vec!["/bin/sh".to_owned(), "-c".to_owned(), script]
+    }
+
+    #[test]
+    fn a_failed_pre_snapshot_hook_follows_the_consistency_settings() {
+        // (no_inconsistent_snapshot, force_post_snapshot_script) -> (snapshot taken, post ran)
+        for (no_inconsistent, force_post, snapshot_taken, post_ran) in [
+            (true, false, false, false),
+            (true, true, false, true),
+            (false, false, true, false),
+        ] {
+            let directory = tempdir().unwrap();
+            let script = directory.path().join("fake-zfs");
+            let zfs_log = directory.path().join("zfs.log");
+            let hook_log = directory.path().join("hook.log");
+            write_script(
+                &script,
+                &format!(
+                    "#!/bin/sh\nprintf '%s\\n' \"$1\" >> '{}'\n",
+                    zfs_log.display()
+                ),
+            );
+            let settings = Settings {
+                zfs_command: script,
+                ..Settings::default()
+            };
+            let policy = Policy {
+                pre_snapshot_script: shell_hook("exit 1".to_owned()),
+                post_snapshot_script: shell_hook(format!(
+                    "echo \"post pre_failure=$ZSNAP_PRE_FAILURE\" >> '{}'",
+                    hook_log.display()
+                )),
+                no_inconsistent_snapshot: no_inconsistent,
+                force_post_snapshot_script: force_post,
+                ..Policy::default()
+            };
+            let plan = Plan {
+                snapshots: vec![snapshot_action("tank/data", "autosnap_new_hourly", &policy)],
+                ..Plan::default()
+            };
+            let report = execute(&plan, &settings, false, false).unwrap();
+            let case = format!("no_inconsistent={no_inconsistent} force_post={force_post}");
+            assert!(!report.succeeded(), "{case}");
+            assert_eq!(
+                report.snapshots_created,
+                usize::from(snapshot_taken),
+                "{case}"
+            );
+            assert_eq!(zfs_log.exists(), snapshot_taken, "{case}");
+            assert_eq!(
+                fs::read_to_string(&hook_log).unwrap_or_default(),
+                if post_ran { "post pre_failure=1\n" } else { "" },
+                "{case}"
+            );
+        }
+    }
+
+    #[test]
+    fn prune_hooks_gate_and_follow_each_destroy() {
+        let directory = tempdir().unwrap();
+        let script = directory.path().join("fake-zfs");
+        let zfs_log = directory.path().join("zfs.log");
+        let hook_log = directory.path().join("hook.log");
+        write_script(
+            &script,
+            &format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\n",
+                zfs_log.display()
+            ),
+        );
+        let settings = Settings {
+            zfs_command: script,
+            ..Settings::default()
+        };
+        let policy = Policy {
+            // Refuse to prune "a"; allow everything else.
+            pre_pruning_script: shell_hook(
+                "[ \"$ZSNAP_SNAPNAME\" != autosnap_a_hourly ]".to_owned(),
+            ),
+            pruning_script: shell_hook(format!(
+                "echo \"$ZSNAP_SCRIPT $ZSNAP_TARGET@$ZSNAP_SNAPNAME\" >> '{}'",
+                hook_log.display()
+            )),
+            ..Policy::default()
+        };
+        let plan = Plan {
+            prunes: vec![PruneAction {
+                pool: "tank".to_owned(),
+                dataset: "tank/data".to_owned(),
+                names: vec![
+                    "autosnap_a_hourly".to_owned(),
+                    "autosnap_b_hourly".to_owned(),
+                ],
+                policy,
+            }],
+            ..Plan::default()
+        };
+        let report = execute(&plan, &settings, false, false).unwrap();
+        assert_eq!(report.snapshots_pruned, 1);
+        assert_eq!(report.errors.len(), 2, "{:?}", report.errors);
+        assert!(report.errors.iter().any(|error| {
+            error.contains("pre-pruning hook failed for tank/data@autosnap_a_hourly; prune skipped")
+        }));
+        assert_eq!(
+            fs::read_to_string(zfs_log).unwrap(),
+            "destroy tank/data@autosnap_b_hourly\n"
+        );
+        assert_eq!(
+            fs::read_to_string(hook_log).unwrap(),
+            "prune tank/data@autosnap_b_hourly\n"
+        );
     }
 
     #[test]
@@ -952,17 +1129,13 @@ mod tests {
         let script = directory.path().join("fake-zfs");
         let state = directory.path().join("state");
         fs::create_dir(&state).unwrap();
-        fs::write(
+        write_script(
             &script,
-            format!(
+            &format!(
                 "#!/bin/sh\ncase \"$*\" in\n  *tank/*) own=tank; other=backup ;;\n  *backup/*) own=backup; other=tank ;;\n  *) exit 64 ;;\nesac\n: > '{state}/'$own\nattempt=0\nwhile [ ! -e '{state}/'$other ]; do\n  attempt=$((attempt + 1))\n  [ \"$attempt\" -lt 100 ] || exit 70\n  sleep 0.01\ndone\n",
                 state = state.display()
             ),
-        )
-        .unwrap();
-        let mut permissions = fs::metadata(&script).unwrap().permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(&script, permissions).unwrap();
+        );
 
         let settings = Settings {
             zfs_command: script,

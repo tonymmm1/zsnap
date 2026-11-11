@@ -1,10 +1,13 @@
 use std::fs;
+use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 use serde_json::Value;
 use tempfile::tempdir;
 use zsnap::config::Config;
+use zsnap::lock::RunLock;
 
 #[test]
 fn plans_and_executes_against_fake_zfs_tools() {
@@ -24,7 +27,7 @@ case "$1" in
   list)
     case "$*" in
       *filesystem,volume*)
-        printf 'tank\ntank/data\nbackup\nbackup/data\n'
+        printf 'tank\t-\ntank/data\t-\nbackup\t-\nbackup/data\t-\n'
         ;;
       *snapshot*)
         :
@@ -218,7 +221,7 @@ fn status_refreshes_atomically_then_reads_without_querying_zfs() {
         &zfs,
         r#"#!/bin/sh
 case "$*" in
-  *filesystem,volume*) printf 'tank\ntank/data\ntank/data/vm\n' ;;
+  *filesystem,volume*) printf 'tank\t-\ntank/data\t-\ntank/data/vm\t-\n' ;;
   *snapshot*) printf 'tank/data@autosnap_hourly\t100\tyes\t0\t-\ntank/data@manual\t90\t-\t0\t-\n' ;;
   *) exit 64 ;;
 esac
@@ -245,6 +248,8 @@ recursive = true
     )
     .unwrap();
 
+    // A refresh only reads ZFS, so it must not contend with the run lock.
+    let run_lock = RunLock::acquire(&lock).unwrap();
     let refreshed = Command::new(env!("CARGO_BIN_EXE_zsnap"))
         .args([
             "--config",
@@ -255,6 +260,7 @@ recursive = true
         ])
         .output()
         .unwrap();
+    drop(run_lock);
     assert!(
         refreshed.status.success(),
         "{}",
@@ -411,7 +417,7 @@ fn failed_zfs_run_attempts_a_failure_notification_and_stays_failed() {
 case "$1" in
   list)
     case "$*" in
-      *filesystem,volume*) printf 'tank\ntank/data\n' ;;
+      *filesystem,volume*) printf 'tank\t-\ntank/data\t-\n' ;;
       *snapshot*) : ;;
     esac
     ;;
@@ -614,11 +620,201 @@ zpool_command = "{}"
     );
 }
 
+/// Writes an executable script through a child process, so this test process never
+/// holds a writable descriptor that a concurrently forking test could inherit (which
+/// makes executing the script fail with ETXTBSY).
 fn write_executable(path: &std::path::Path, contents: &str) {
-    fs::write(path, contents).unwrap();
-    let mut permissions = fs::metadata(path).unwrap().permissions();
-    permissions.set_mode(0o755);
-    fs::set_permissions(path, permissions).unwrap();
+    let mut writer = Command::new("/bin/sh")
+        .args(["-c", "cat > \"$1\" && chmod 755 \"$1\"", "sh"])
+        .arg(path)
+        .stdin(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = writer.stdin.take().unwrap();
+    stdin.write_all(contents.as_bytes()).unwrap();
+    drop(stdin);
+    assert!(writer.wait().unwrap().success());
+}
+
+/// A config whose fake `zfs` lists `tank` and `tank/data` and records mutations.
+fn fake_host(directory: &std::path::Path, zfs_script: &str, extra: &str) -> std::path::PathBuf {
+    let zfs = directory.join("zfs");
+    let zpool = directory.join("zpool");
+    let config = directory.join("zsnap.toml");
+    write_executable(&zfs, zfs_script);
+    write_executable(&zpool, "#!/bin/sh\nprintf 'tank\\t50\\n'\n");
+    fs::write(
+        &config,
+        format!(
+            "version = 1\n[settings]\nzfs_command = \"{}\"\nzpool_command = \"{}\"\nlock_file = \"{}\"\ncache_file = \"{}\"\n{extra}",
+            zfs.display(),
+            zpool.display(),
+            directory.join("zsnap.lock").display(),
+            directory.join("zsnap.cache").display(),
+        ),
+    )
+    .unwrap();
+    config
+}
+
+const LISTING_ZFS: &str = r#"#!/bin/sh
+case "$1" in
+  list) case "$*" in *filesystem,volume*) printf 'tank\t-\ntank/data\t-\n' ;; esac ;;
+esac
+"#;
+
+#[test]
+fn nested_sections_are_not_rescanned_and_missing_ones_are_reported() {
+    let directory = tempdir().unwrap();
+    let calls = directory.path().join("list-args.log");
+    let zfs = format!(
+        r#"#!/bin/sh
+case "$1" in
+  list)
+    printf '%s\n' "$*" >> '{}'
+    case "$*" in *filesystem,volume*) printf 'tank\t-\ntank/data\t-\ntank/data/db\t-\n' ;; esac ;;
+esac
+"#,
+        calls.display()
+    );
+    let config = fake_host(
+        directory.path(),
+        &zfs,
+        "[tank]\nrecursive = true\n[tank/data/db]\nhourly = 1\n",
+    );
+
+    let plan = Command::new(env!("CARGO_BIN_EXE_zsnap"))
+        .args(["--config", config.to_str().unwrap(), "plan"])
+        .output()
+        .unwrap();
+    assert!(
+        plan.status.success(),
+        "{}",
+        String::from_utf8_lossy(&plan.stderr)
+    );
+    let lists = fs::read_to_string(&calls).unwrap();
+    assert_eq!(lists.lines().count(), 2, "{lists}");
+    for line in lists.lines() {
+        // Only the topmost root is listed recursively; tank/data/db is covered by it.
+        assert!(line.ends_with(" tank"), "{line}");
+    }
+
+    let config = fake_host(directory.path(), &zfs, "[tank]\n[tank/missing]\n");
+    let check = Command::new(env!("CARGO_BIN_EXE_zsnap"))
+        .args(["--config", config.to_str().unwrap(), "check", "--probe"])
+        .output()
+        .unwrap();
+    assert!(!check.status.success());
+    let stderr = String::from_utf8_lossy(&check.stderr);
+    assert!(
+        stderr.contains("reference missing names:\n  - tank/missing\n"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn notify_test_works_before_any_dataset_is_configured() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let output = Command::new(env!("CARGO_BIN_EXE_zsnap"))
+        .args([
+            "--config",
+            root.join("contrib/zsnap.toml.example").to_str().unwrap(),
+            "notify-test",
+        ])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    // The starter config has no webhooks; it must not fail on the missing datasets.
+    assert!(
+        stderr.contains("no enabled notification webhooks are configured"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn hook_output_does_not_corrupt_json_reports() {
+    let directory = tempdir().unwrap();
+    let hook = directory.path().join("hook");
+    write_executable(&hook, "#!/bin/sh\necho 'database frozen'\n");
+    let config = fake_host(
+        directory.path(),
+        LISTING_ZFS,
+        &format!(
+            "[tank/data]\nhourly = 1\ndaily = 0\nmonthly = 0\npre_snapshot_script = [\"{}\"]\n",
+            hook.display()
+        ),
+    );
+
+    let run = Command::new(env!("CARGO_BIN_EXE_zsnap"))
+        .args(["--config", config.to_str().unwrap(), "--json", "run"])
+        .output()
+        .unwrap();
+    assert!(
+        run.status.success(),
+        "{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let report: Value = serde_json::from_slice(&run.stdout).expect("stdout is only JSON");
+    assert_eq!(report["snapshots_created"], 1);
+    assert!(String::from_utf8_lossy(&run.stderr).contains("database frozen"));
+}
+
+#[test]
+fn a_hung_zfs_command_times_out_and_reports_the_failure() {
+    let directory = tempdir().unwrap();
+    let config = fake_host(
+        directory.path(),
+        "#!/bin/sh\nexec sleep 60\n",
+        "zfs_timeout = 1\n[notifications]\nmax_attempts = 1\ntimeout_seconds = 1\n[[notifications.webhooks]]\nname = \"ops\"\nkind = \"slack\"\nurl = \"https://127.0.0.1:1/hook\"\n[tank/data]\n",
+    );
+
+    let started = Instant::now();
+    let run = Command::new(env!("CARGO_BIN_EXE_zsnap"))
+        .args(["--config", config.to_str().unwrap(), "run"])
+        .output()
+        .unwrap();
+    assert!(started.elapsed() < Duration::from_secs(30));
+    assert!(!run.status.success());
+    let stderr = String::from_utf8_lossy(&run.stderr);
+    assert!(stderr.contains("timed out after 1s"), "{stderr}");
+    // The run returned, so the failure webhook was attempted instead of hanging silently.
+    assert!(stderr.contains("NOTIFICATION ERROR [slack:ops"), "{stderr}");
+}
+
+#[test]
+fn refuses_to_run_when_the_ownership_marker_is_set_on_a_dataset() {
+    let directory = tempdir().unwrap();
+    let calls = directory.path().join("calls.log");
+    // tank/data carries the marker itself, so its unmarked snapshots would inherit it.
+    let zfs = format!(
+        r#"#!/bin/sh
+case "$1" in
+  list)
+    case "$*" in
+      *filesystem,volume*) printf 'tank\t-\ntank/data\tyes\n' ;;
+      *snapshot*) printf 'tank/data@autosnap_2020-01-01_00:00:00_hourly\t1577836800\tyes\t0\t-\n' ;;
+    esac ;;
+  snapshot|destroy) printf '%s\n' "$*" >> '{}' ;;
+esac
+"#,
+        calls.display()
+    );
+    let config = fake_host(
+        directory.path(),
+        &zfs,
+        "[tank/data]\nhourly = 0\ndaily = 0\nmonthly = 0\n",
+    );
+
+    let run = Command::new(env!("CARGO_BIN_EXE_zsnap"))
+        .args(["--config", config.to_str().unwrap(), "run"])
+        .output()
+        .unwrap();
+    assert!(!run.status.success());
+    let stderr = String::from_utf8_lossy(&run.stderr);
+    assert!(stderr.contains("org.zsnap:managed is set on"), "{stderr}");
+    assert!(stderr.contains("  - tank/data"), "{stderr}");
+    assert!(!calls.exists(), "zsnap mutated ZFS despite the marker");
 }
 
 fn calls_for(path: &std::path::Path, command: &str) -> usize {

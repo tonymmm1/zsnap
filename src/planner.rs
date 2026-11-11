@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use anyhow::{Context, Result, bail};
 use chrono::{
@@ -166,6 +166,17 @@ pub fn build_plan(
     }
 
     let timestamp = snapshot_timestamp(config.settings.timezone, now);
+    // Classify every snapshot name once; the loops below consult it per kind.
+    let kind_of: HashMap<&str, Option<SnapshotKind>> = inventory
+        .snapshots
+        .iter()
+        .map(|snapshot| {
+            (
+                snapshot.name.as_str(),
+                snapshot_kind(&config.settings.snapshot_prefix, &snapshot.name),
+            )
+        })
+        .collect();
     let mut plan = Plan::default();
     for dataset in datasets {
         let snapshots = by_dataset
@@ -186,10 +197,7 @@ pub fn build_plan(
                 }
                 let newest = snapshots
                     .iter()
-                    .filter(|snapshot| {
-                        snapshot_kind(&config.settings.snapshot_prefix, &snapshot.name)
-                            == Some(kind)
-                    })
+                    .filter(|snapshot| kind_of[snapshot.name.as_str()] == Some(kind))
                     .map(|snapshot| snapshot.created)
                     .max();
                 if snapshot_due(kind, &dataset.policy, newest, now, config.settings.timezone)? {
@@ -235,31 +243,36 @@ pub fn build_plan(
         let mut names = Vec::new();
         for kind in SnapshotKind::ALL {
             let keep = dataset.policy.retention(kind) as usize;
-            for snapshot in snapshots.iter().filter(|snapshot| {
-                snapshot_kind(&config.settings.snapshot_prefix, &snapshot.name) == Some(kind)
-                    && snapshot.managed
-                    && snapshot.prune_protected()
-            }) {
-                plan.protected_snapshots.push(ProtectedSnapshot {
-                    pool: dataset.pool.clone(),
-                    dataset: dataset.name.clone(),
-                    name: snapshot.name.clone(),
-                    user_holds: snapshot.user_holds,
-                    has_clones: snapshot.has_clones,
-                });
-            }
-            let mut matching: Vec<_> = snapshots
+            let cutoff = now.timestamp()
+                - kind.approximate_period_seconds(dataset.policy.frequent_period) * keep as i64;
+            let managed: Vec<_> = snapshots
                 .iter()
                 .filter(|snapshot| {
-                    snapshot_kind(&config.settings.snapshot_prefix, &snapshot.name) == Some(kind)
-                        && snapshot.managed
-                        && !snapshot.prune_protected()
+                    kind_of[snapshot.name.as_str()] == Some(kind) && snapshot.managed
                 })
                 .copied()
                 .collect();
+            // Report a hold or clone only when it is what keeps an expired snapshot
+            // alive, not for every held snapshot still inside its retention window.
+            if managed.len() > keep {
+                for snapshot in managed
+                    .iter()
+                    .filter(|snapshot| snapshot.prune_protected() && snapshot.created < cutoff)
+                {
+                    plan.protected_snapshots.push(ProtectedSnapshot {
+                        pool: dataset.pool.clone(),
+                        dataset: dataset.name.clone(),
+                        name: snapshot.name.clone(),
+                        user_holds: snapshot.user_holds,
+                        has_clones: snapshot.has_clones,
+                    });
+                }
+            }
+            let mut matching: Vec<_> = managed
+                .into_iter()
+                .filter(|snapshot| !snapshot.prune_protected())
+                .collect();
             matching.sort_by_key(|snapshot| (snapshot.created, &snapshot.name));
-            let cutoff = now.timestamp()
-                - kind.approximate_period_seconds(dataset.policy.frequent_period) * keep as i64;
             let mut remaining = matching.len();
             for snapshot in matching {
                 if remaining > keep && snapshot.created < cutoff {
@@ -321,9 +334,8 @@ pub fn snapshot_kind(prefix: &str, name: &str) -> Option<SnapshotKind> {
         let Some(timestamp) = remainder.strip_suffix(&format!("_{}", kind.as_str())) else {
             continue;
         };
-        // Sanoid can append "dst" directly to the timestamp during the repeated
-        // daylight-saving hour. UTC-native zsnap never generates this form, but
-        // accepts it when assessing compatible history.
+        // Sanoid appends "dst" directly to the timestamp during the repeated
+        // daylight-saving hour, and so does zsnap with timezone = "local".
         let timestamp = timestamp
             .strip_suffix("_dst")
             .or_else(|| timestamp.strip_suffix("dst"))
@@ -766,6 +778,203 @@ mod tests {
         );
         assert!(plan.protected_snapshots[0].user_holds > 0);
         assert!(plan.protected_snapshots[1].has_clones);
+    }
+
+    #[test]
+    fn each_schedule_kind_resolves_its_most_recent_boundary() {
+        // Wednesday 2026-08-26 10:00 UTC.
+        let now = Utc.with_ymd_and_hms(2026, 8, 26, 10, 0, 0).unwrap();
+        let at = |y, m, d, h, min| Utc.with_ymd_and_hms(y, m, d, h, min, 0).unwrap();
+        let default = Policy::default();
+        let cases = [
+            (
+                SnapshotKind::Frequently,
+                default.clone(),
+                at(2026, 8, 26, 10, 0),
+            ),
+            (
+                SnapshotKind::Hourly,
+                default.clone(),
+                at(2026, 8, 26, 10, 0),
+            ),
+            // 23:59 today has not happened yet, so yesterday's applies.
+            (
+                SnapshotKind::Daily,
+                default.clone(),
+                at(2026, 8, 25, 23, 59),
+            ),
+            (
+                SnapshotKind::Weekly,
+                default.clone(),
+                at(2026, 8, 24, 23, 30),
+            ),
+            (
+                SnapshotKind::Weekly,
+                Policy {
+                    weekly_wday: 3,
+                    ..default.clone()
+                },
+                at(2026, 8, 19, 23, 30),
+            ),
+            (SnapshotKind::Monthly, default.clone(), at(2026, 8, 1, 0, 0)),
+            (
+                SnapshotKind::Monthly,
+                Policy {
+                    monthly_mday: 28,
+                    ..default.clone()
+                },
+                at(2026, 7, 28, 0, 0),
+            ),
+            (SnapshotKind::Yearly, default.clone(), at(2026, 1, 1, 0, 0)),
+            (
+                SnapshotKind::Yearly,
+                Policy {
+                    yearly_mon: 12,
+                    yearly_mday: 25,
+                    ..default.clone()
+                },
+                at(2025, 12, 25, 0, 0),
+            ),
+            // February 29 falls back to the 28th in a common year.
+            (
+                SnapshotKind::Yearly,
+                Policy {
+                    yearly_mon: 2,
+                    yearly_mday: 29,
+                    ..default.clone()
+                },
+                at(2026, 2, 28, 0, 0),
+            ),
+        ];
+        for (kind, policy, expected) in cases {
+            assert_eq!(
+                most_recent_preferred_in(kind, &policy, now, &Utc).unwrap(),
+                expected,
+                "{kind}"
+            );
+        }
+    }
+
+    /// UTC-5 until 2026-03-08 07:00 UTC, then UTC-4: local 02:00-02:59 does not exist.
+    #[derive(Clone, Copy, Debug)]
+    struct SpringForward;
+
+    impl SpringForward {
+        fn transition() -> NaiveDateTime {
+            NaiveDate::from_ymd_opt(2026, 3, 8)
+                .unwrap()
+                .and_hms_opt(7, 0, 0)
+                .unwrap()
+        }
+    }
+
+    impl TimeZone for SpringForward {
+        type Offset = FixedOffset;
+
+        fn from_offset(_: &FixedOffset) -> Self {
+            Self
+        }
+
+        fn offset_from_local_date(&self, local: &NaiveDate) -> LocalResult<FixedOffset> {
+            self.offset_from_local_datetime(&local.and_hms_opt(0, 0, 0).unwrap())
+        }
+
+        fn offset_from_local_datetime(&self, local: &NaiveDateTime) -> LocalResult<FixedOffset> {
+            let gap_start = Self::transition() - Duration::hours(5);
+            if *local < gap_start {
+                LocalResult::Single(FixedOffset::west_opt(5 * 3600).unwrap())
+            } else if *local < gap_start + Duration::hours(1) {
+                LocalResult::None
+            } else {
+                LocalResult::Single(FixedOffset::west_opt(4 * 3600).unwrap())
+            }
+        }
+
+        fn offset_from_utc_date(&self, utc: &NaiveDate) -> FixedOffset {
+            self.offset_from_utc_datetime(&utc.and_hms_opt(0, 0, 0).unwrap())
+        }
+
+        fn offset_from_utc_datetime(&self, utc: &NaiveDateTime) -> FixedOffset {
+            let hours = if *utc < Self::transition() { 5 } else { 4 };
+            FixedOffset::west_opt(hours * 3600).unwrap()
+        }
+    }
+
+    #[test]
+    fn a_boundary_inside_a_forward_clock_gap_moves_past_the_gap() {
+        let policy = Policy {
+            daily_hour: 2,
+            daily_min: 30,
+            ..Policy::default()
+        };
+        // 02:30 local does not exist on 2026-03-08; it becomes 03:30 EDT (07:30 UTC).
+        let after = Utc.with_ymd_and_hms(2026, 3, 8, 12, 0, 0).unwrap();
+        assert_eq!(
+            most_recent_preferred_in(SnapshotKind::Daily, &policy, after, &SpringForward).unwrap(),
+            Utc.with_ymd_and_hms(2026, 3, 8, 7, 30, 0).unwrap()
+        );
+        // Before the shifted boundary, the previous day's 02:30 EST applies.
+        let before = Utc.with_ymd_and_hms(2026, 3, 8, 6, 0, 0).unwrap();
+        assert_eq!(
+            most_recent_preferred_in(SnapshotKind::Daily, &policy, before, &SpringForward).unwrap(),
+            Utc.with_ymd_and_hms(2026, 3, 7, 7, 30, 0).unwrap()
+        );
+    }
+
+    #[test]
+    fn atomic_recursion_snapshots_the_root_once_and_prunes_children_individually() {
+        let mut config = test_config();
+        config.datasets.get_mut("tank/data").unwrap().recursive = Recursion::Zfs;
+        let mut inventory = test_inventory();
+        let now = Utc.with_ymd_and_hms(2026, 8, 27, 12, 10, 0).unwrap();
+        for (hours_ago, hour) in [(5, 7), (4, 8), (3, 9), (1, 11)] {
+            inventory.snapshots.push(Snapshot {
+                dataset: "tank/data/db".to_owned(),
+                name: format!("autosnap_2026-08-27_{hour:02}:10:00_hourly"),
+                created: (now - Duration::hours(hours_ago)).timestamp(),
+                managed: true,
+                user_holds: 0,
+                has_clones: false,
+            });
+        }
+        let resolved = resolve_datasets(&config, &inventory).unwrap();
+        let plan = build_plan(&config, &inventory, &resolved, now).unwrap();
+
+        assert_eq!(plan.snapshots.len(), 1);
+        assert_eq!(plan.snapshots[0].dataset, "tank/data");
+        assert!(plan.snapshots[0].recursive);
+        assert_eq!(plan.prunes.len(), 1);
+        assert_eq!(plan.prunes[0].dataset, "tank/data/db");
+        assert_eq!(
+            plan.prunes[0].names,
+            [
+                "autosnap_2026-08-27_07:10:00_hourly",
+                "autosnap_2026-08-27_08:10:00_hourly"
+            ]
+        );
+    }
+
+    #[test]
+    fn holds_inside_the_retention_window_are_not_reported_as_protected() {
+        let config = test_config();
+        let mut inventory = test_inventory();
+        let now = Utc.with_ymd_and_hms(2026, 8, 27, 12, 10, 0).unwrap();
+        // hourly = 2: the held snapshot is 30 minutes old, far from expiring.
+        for (minutes_ago, user_holds) in [(30, 1), (90, 0), (150, 0), (210, 0)] {
+            let created = now - Duration::minutes(minutes_ago);
+            inventory.snapshots.push(Snapshot {
+                dataset: "tank/data".to_owned(),
+                name: format!("autosnap_{}_hourly", created.format("%Y-%m-%d_%H:%M:%S")),
+                created: created.timestamp(),
+                managed: true,
+                user_holds,
+                has_clones: false,
+            });
+        }
+        let resolved = resolve_datasets(&config, &inventory).unwrap();
+        let plan = build_plan(&config, &inventory, &resolved, now).unwrap();
+        assert_eq!(plan.protected_snapshot_count(), 0);
+        assert_eq!(plan.prune_count(), 1);
     }
 
     #[test]

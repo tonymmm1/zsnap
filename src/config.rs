@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Deserializer, Serialize};
@@ -10,7 +11,7 @@ use crate::model::SnapshotKind;
 
 const DEFAULT_PREFIX: &str = "autosnap";
 const DEFAULT_LOCK_FILE: &str = "/run/zsnap/zsnap.lock";
-const DEFAULT_CACHE_FILE: &str = "/etc/zsnap/zsnap.cache";
+const DEFAULT_CACHE_FILE: &str = "/var/lib/zsnap/zsnap.cache";
 const MAX_SNAPSHOT_BATCH_SIZE: usize = 256;
 const MAX_PRUNE_BATCH_SIZE: usize = 128;
 const POLICY_KEYS: &[&str] = &[
@@ -184,6 +185,8 @@ pub struct Settings {
     pub cache_file: PathBuf,
     pub zfs_command: PathBuf,
     pub zpool_command: PathBuf,
+    /// Seconds before a single `zfs` or `zpool` invocation is killed; 0 waits forever.
+    pub zfs_timeout: u64,
 }
 
 impl Default for Settings {
@@ -198,6 +201,7 @@ impl Default for Settings {
             cache_file: PathBuf::from(DEFAULT_CACHE_FILE),
             zfs_command: PathBuf::from("zfs"),
             zpool_command: PathBuf::from("zpool"),
+            zfs_timeout: 3_600,
         }
     }
 }
@@ -503,12 +507,17 @@ impl Policy {
 
 impl Config {
     pub fn load(path: &Path) -> Result<Self> {
-        let raw = fs::read_to_string(path)
-            .with_context(|| format!("failed to read configuration {}", path.display()))?;
-        let config = Self::parse(&raw)
-            .with_context(|| format!("failed to parse TOML configuration {}", path.display()))?;
+        let config = Self::read(path)?;
         config.validate()?;
         Ok(config)
+    }
+
+    /// Reads and parses a configuration without semantic validation.
+    pub fn read(path: &Path) -> Result<Self> {
+        let raw = fs::read_to_string(path)
+            .with_context(|| format!("failed to read configuration {}", path.display()))?;
+        Self::parse(&raw)
+            .with_context(|| format!("failed to parse TOML configuration {}", path.display()))
     }
 
     pub fn parse(raw: &str) -> Result<Self> {
@@ -595,8 +604,25 @@ impl Config {
 
 fn expand_config_shorthand(raw: &str) -> Result<String> {
     let mut expanded = String::with_capacity(raw.len());
+    // The delimiter of the multi-line string the current line is inside, if any.
+    let mut multiline: Option<&str> = None;
     for (index, line) in raw.lines().enumerate() {
         let trimmed = line.trim();
+        if let Some(delimiter) = multiline {
+            // Text inside a string (such as a hook script) is never shorthand.
+            if line.matches(delimiter).count() % 2 == 1 {
+                multiline = None;
+            }
+            expanded.push_str(line);
+            expanded.push('\n');
+            continue;
+        }
+        // ponytail: counts delimiters per line, so a triple quote inside another
+        // string or comment on the opening line is misread; use a TOML lexer if
+        // that ever matters.
+        multiline = ["\"\"\"", "'''"]
+            .into_iter()
+            .find(|delimiter| line.matches(delimiter).count() % 2 == 1);
         if let Some(header) = friendly_template_header(trimmed, index + 1)? {
             expanded.push_str(&header);
         } else if let Some(header) = friendly_dataset_header(trimmed, index + 1)? {
@@ -786,6 +812,10 @@ fn normalize_inline_dataset_policies(value: &mut toml::Value) -> Result<()> {
 }
 
 impl Settings {
+    pub fn zfs_timeout(&self) -> Option<Duration> {
+        (self.zfs_timeout > 0).then(|| Duration::from_secs(self.zfs_timeout))
+    }
+
     fn validate(&self) -> Result<()> {
         validate_batch_sizes(self.snapshot_batch_size, self.prune_batch_size, "settings")?;
         ensure_nonempty_path(&self.lock_file, "settings.lock_file")?;
@@ -1041,6 +1071,49 @@ autosnap = false
             .unwrap_err()
             .to_string();
         assert!(unknown.contains("schema"), "{unknown}");
+    }
+
+    #[test]
+    fn inline_policy_keys_match_the_policy_schema() {
+        // POLICY_KEYS is maintained by hand; a key missing here would be rejected
+        // when written inline in a dataset section instead of under [.policy].
+        let schema = serde_json::to_value(PolicyPatch::default()).unwrap();
+        let mut fields: Vec<&str> = schema
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        let mut keys = POLICY_KEYS.to_vec();
+        fields.sort_unstable();
+        keys.sort_unstable();
+        assert_eq!(keys, fields);
+    }
+
+    #[test]
+    fn shorthand_is_not_expanded_inside_multiline_strings() {
+        let config = Config::parse(
+            r#"
+version = 1
+
+[tank/data]
+pre_snapshot_script = ["/bin/sh", "-c", """
+[ -e /run/db.ready ]
+use_templates = [base]
+"""]
+
+[tank/logs]
+daily = 7
+"#,
+        )
+        .unwrap();
+        let hook = config.datasets["tank/data"]
+            .policy
+            .pre_snapshot_script
+            .as_ref()
+            .unwrap();
+        assert_eq!(hook[2], "[ -e /run/db.ready ]\nuse_templates = [base]\n");
+        assert_eq!(config.datasets["tank/logs"].policy.daily, Some(7));
     }
 
     #[test]

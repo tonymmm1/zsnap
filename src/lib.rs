@@ -6,5 +6,6 @@ pub mod model;
 pub mod notification;
 mod parallel;
 pub mod planner;
+mod process;
 pub mod status;
 pub mod zfs;
