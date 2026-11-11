@@ -52,6 +52,14 @@ if ! command -v "$nfpm" >/dev/null 2>&1; then
 fi
 
 mkdir -p "$dist_dir"
+
+# contrib/ holds the single copy of each service file; packages install to /usr/bin.
+service_dir=$(mktemp -d "${TMPDIR:-/tmp}/zsnap-service.XXXXXX")
+trap 'rm -rf "$service_dir"' 0 HUP INT TERM
+for file in zsnap.service zsnap.openrc zsnap.periodic; do
+  sed 's|/usr/local/sbin/zsnap|/usr/bin/zsnap|' "contrib/$file" > "$service_dir/$file"
+done
+export PACKAGE_SERVICE_DIR="$service_dir"
 export PACKAGE_ARCH="$package_arch"
 export PACKAGE_BINARY="$binary"
 export PACKAGE_VERSION="$version"

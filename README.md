@@ -345,12 +345,15 @@ the user-edited configuration, webhook environment file, and reporting cache.
 Every push and pull request runs formatting, Clippy with warnings denied, the full
 test suite, a verified static-musl build, and source builds inside Ubuntu, Debian,
 Fedora, CentOS Stream, RHEL UBI, Rocky Linux, Alpine, and Arch containers.
+`Cargo.lock` is checked against the RustSec advisory database whenever dependencies
+change and once a week.
 
 Pushing an annotated `vMAJOR.MINOR.PATCH` tag runs the tests again and creates a
 GitHub release for x86-64 and ARM64. Each architecture is compiled and smoke-tested
 on a matching native GitHub runner. The release contains a portable static archive,
 Debian package, RPM package, Alpine package, Arch Linux package, and an individual
-SHA-256 file for every artifact. The tag must exactly match the package version in
+SHA-256 file for every artifact. Every artifact also carries a signed GitHub
+build-provenance attestation. The tag must exactly match the package version in
 `Cargo.toml`:
 
 ```console
@@ -364,6 +367,7 @@ directly; ZFS command-line tools are still required at runtime:
 
 ```console
 sha256sum --check zsnap-0.1.3-x86_64-unknown-linux-musl.tar.gz.sha256
+gh attestation verify zsnap-0.1.3-x86_64-unknown-linux-musl.tar.gz --repo tonymmm1/zsnap
 tar -xzf zsnap-0.1.3-x86_64-unknown-linux-musl.tar.gz
 sudo install -m755 zsnap-0.1.3-x86_64-unknown-linux-musl/zsnap /usr/local/sbin/zsnap
 ```

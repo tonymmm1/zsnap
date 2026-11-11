@@ -50,27 +50,32 @@ contents:
     dst: /usr/share/doc/zsnap/examples/zsnap.toml
     file_info:
       mode: 0644
-  - src: packaging/zsnap.periodic
+  - src: ${PACKAGE_SERVICE_DIR}/zsnap.periodic
+    expand: true
     dst: /usr/share/zsnap/zsnap.periodic
     packager: deb
     file_info:
       mode: 0755
-  - src: packaging/zsnap.periodic
+  - src: ${PACKAGE_SERVICE_DIR}/zsnap.periodic
+    expand: true
     dst: /usr/share/zsnap/zsnap.periodic
     packager: rpm
     file_info:
       mode: 0755
-  - src: packaging/zsnap.periodic
+  - src: ${PACKAGE_SERVICE_DIR}/zsnap.periodic
+    expand: true
     dst: /usr/share/zsnap/zsnap.periodic
     packager: archlinux
     file_info:
       mode: 0755
-  - src: packaging/zsnap.periodic
+  - src: ${PACKAGE_SERVICE_DIR}/zsnap.periodic
+    expand: true
     dst: /etc/periodic/15min/zsnap
     packager: apk
     file_info:
       mode: 0755
-  - src: packaging/zsnap.service
+  - src: ${PACKAGE_SERVICE_DIR}/zsnap.service
+    expand: true
     dst: /usr/lib/systemd/system/zsnap.service
     packager: deb
     file_info:
@@ -80,7 +85,8 @@ contents:
     packager: deb
     file_info:
       mode: 0644
-  - src: packaging/zsnap.service
+  - src: ${PACKAGE_SERVICE_DIR}/zsnap.service
+    expand: true
     dst: /usr/lib/systemd/system/zsnap.service
     packager: rpm
     file_info:
@@ -90,7 +96,8 @@ contents:
     packager: rpm
     file_info:
       mode: 0644
-  - src: packaging/zsnap.service
+  - src: ${PACKAGE_SERVICE_DIR}/zsnap.service
+    expand: true
     dst: /usr/lib/systemd/system/zsnap.service
     packager: archlinux
     file_info:
@@ -100,7 +107,8 @@ contents:
     packager: archlinux
     file_info:
       mode: 0644
-  - src: packaging/zsnap.openrc
+  - src: ${PACKAGE_SERVICE_DIR}/zsnap.openrc
+    expand: true
     dst: /etc/init.d/zsnap
     packager: apk
     file_info:

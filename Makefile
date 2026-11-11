@@ -27,6 +27,8 @@ SERVICE_TARGET := $(DESTDIR)$(SYSTEMD_UNIT_DIR)/zsnap.service
 TIMER_TARGET := $(DESTDIR)$(SYSTEMD_UNIT_DIR)/zsnap.timer
 OPENRC_TARGET := $(DESTDIR)$(OPENRC_INIT_DIR)/zsnap
 PERIODIC_TARGET := $(DESTDIR)$(PERIODIC_DIR)/zsnap
+# The files in contrib/ name the default binary path; point them at BINDIR instead.
+WITH_BINDIR := sed 's|/usr/local/sbin/zsnap|$(BINDIR)/zsnap|'
 
 .PHONY: all build release test check fmt lint benchmark install install-binary install-static \
 	install-static-binary install-config install-systemd install-openrc install-static-openrc \
@@ -117,12 +119,14 @@ install-config:
 
 install-systemd:
 	install -d -m755 $(DESTDIR)$(SYSTEMD_UNIT_DIR)
-	install -m644 contrib/zsnap.service $(SERVICE_TARGET)
+	$(WITH_BINDIR) contrib/zsnap.service > $(SERVICE_TARGET)
+	chmod 644 $(SERVICE_TARGET)
 	install -m644 contrib/zsnap.timer $(TIMER_TARGET)
 
 install-openrc-service:
 	install -d -m755 $(DESTDIR)$(OPENRC_INIT_DIR)
-	install -m755 contrib/zsnap.openrc $(OPENRC_TARGET)
+	$(WITH_BINDIR) contrib/zsnap.openrc > $(OPENRC_TARGET)
+	chmod 755 $(OPENRC_TARGET)
 
 enable:
 	@test -z "$(DESTDIR)" || { echo "enable cannot be used with DESTDIR" >&2; exit 2; }
@@ -132,7 +136,8 @@ enable:
 enable-openrc:
 	@test -z "$(DESTDIR)" || { echo "enable-openrc cannot be used with DESTDIR" >&2; exit 2; }
 	install -d -m755 $(PERIODIC_DIR)
-	install -m755 contrib/zsnap.periodic $(PERIODIC_DIR)/zsnap
+	$(WITH_BINDIR) contrib/zsnap.periodic > $(PERIODIC_DIR)/zsnap
+	chmod 755 $(PERIODIC_DIR)/zsnap
 	rc-update add crond default
 	rc-service crond start
 

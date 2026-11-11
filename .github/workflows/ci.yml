@@ -36,8 +36,6 @@ jobs:
           contrib/zsnap.periodic
           packaging/postinstall.sh
           packaging/postremove.sh
-          packaging/zsnap.openrc
-          packaging/zsnap.periodic
       - name: Validate Bash benchmark harness
         run: |
           bash -n benchmarks/run-zfs-benchmark.sh benchmarks/zfs-benchmark.sh

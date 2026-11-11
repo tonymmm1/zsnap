@@ -38,6 +38,10 @@ jobs:
     needs: test
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 20
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
     strategy:
       fail-fast: false
       matrix:
@@ -99,6 +103,12 @@ jobs:
             "${{ matrix.target }}" \
             "${RELEASE_TAG#v}" \
             "${{ matrix.package-arch }}"
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v4
+        with:
+          subject-path: |
+            dist/*
+            !dist/*.sha256
       - uses: actions/upload-artifact@v7
         with:
           name: release-${{ matrix.target }}

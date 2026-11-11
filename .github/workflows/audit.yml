@@ -1,0 +1,35 @@
+name: Security audit
+
+# Checks Cargo.lock against the RustSec advisory database. The weekly run catches
+# advisories published after a dependency was locked.
+on:
+  push:
+    paths:
+      - Cargo.toml
+      - Cargo.lock
+      - .github/workflows/audit.yml
+  pull_request:
+    paths:
+      - Cargo.toml
+      - Cargo.lock
+  schedule:
+    - cron: "23 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      # Built outside the checkout so the repository's pinned toolchain (which may be
+      # older than cargo-audit's minimum Rust version) is not used to compile it.
+      - name: Install cargo-audit
+        working-directory: ${{ runner.temp }}
+        run: cargo +stable install cargo-audit --locked
+      - name: Audit Cargo.lock
+        run: cargo-audit audit
