@@ -357,8 +357,8 @@ build-provenance attestation. The tag must exactly match the package version in
 `Cargo.toml`:
 
 ```console
-git tag -a v0.1.3 -m "zsnap 0.1.3"
-git push origin v0.1.3
+git tag -a v0.1.4 -m "zsnap 0.1.4"
+git push origin v0.1.4
 ```
 
 The release archives contain the executable, example configuration, systemd and
@@ -366,10 +366,10 @@ OpenRC scheduling files, README, and license. A downloaded binary can be install
 directly; ZFS command-line tools are still required at runtime:
 
 ```console
-sha256sum --check zsnap-0.1.3-x86_64-unknown-linux-musl.tar.gz.sha256
-gh attestation verify zsnap-0.1.3-x86_64-unknown-linux-musl.tar.gz --repo tonymmm1/zsnap
-tar -xzf zsnap-0.1.3-x86_64-unknown-linux-musl.tar.gz
-sudo install -m755 zsnap-0.1.3-x86_64-unknown-linux-musl/zsnap /usr/local/sbin/zsnap
+sha256sum --check zsnap-0.1.4-x86_64-unknown-linux-musl.tar.gz.sha256
+gh attestation verify zsnap-0.1.4-x86_64-unknown-linux-musl.tar.gz --repo tonymmm1/zsnap
+tar -xzf zsnap-0.1.4-x86_64-unknown-linux-musl.tar.gz
+sudo install -m755 zsnap-0.1.4-x86_64-unknown-linux-musl/zsnap /usr/local/sbin/zsnap
 ```
 
 Native packages install the binary as `/usr/bin/zsnap`, preserve existing files in
@@ -378,10 +378,10 @@ periodic job. The dataset-neutral starter cannot create or prune anything until
 real dataset sections are added. Install the appropriate downloaded package:
 
 ```console
-sudo apt install ./zsnap_0.1.3_amd64.deb
-sudo dnf install ./zsnap-0.1.3-1.x86_64.rpm
-sudo apk add --allow-untrusted ./zsnap-0.1.3-x86_64.apk
-sudo pacman -U ./zsnap-0.1.3-1-x86_64.pkg.tar.zst
+sudo apt install ./zsnap_0.1.4_amd64.deb
+sudo dnf install ./zsnap-0.1.4-1.x86_64.rpm
+sudo apk add --allow-untrusted ./zsnap-0.1.4-x86_64.apk
+sudo pacman -U ./zsnap-0.1.4-1-x86_64.pkg.tar.zst
 ```
 
 The APK is an unsigned standalone release artifact, hence `--allow-untrusted`.
@@ -695,6 +695,6 @@ your existing migration policy when they are no longer needed.
 This is an independent Rust implementation informed by Sanoid's public behavior
 and documentation. It does not contain Sanoid's Perl source. Snapshot replication,
 Nagios-compatible health checks, bookmarks, holds, and send/receive orchestration
-are not part of version 0.1.3.
+are not part of version 0.1.4.
 
 Licensed under MIT. See [`LICENSE`](LICENSE).
