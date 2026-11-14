@@ -291,6 +291,7 @@ mod tests {
                 .into_iter()
                 .map(|pool| (pool.name.clone(), pool))
                 .collect(),
+            missing: Default::default(),
         };
         let policy = Policy::default();
         let plan = Plan {

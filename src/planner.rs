@@ -103,6 +103,9 @@ pub fn resolve_datasets(config: &Config, inventory: &Inventory) -> Result<Vec<Re
 
     let mut resolved: BTreeMap<String, ResolvedDataset> = BTreeMap::new();
     for (root, section) in sections {
+        if inventory.missing.contains(root) {
+            continue;
+        }
         if !inventory.datasets.contains(root) {
             bail!("configured dataset {root:?} does not exist in the ZFS inventory");
         }
@@ -617,6 +620,7 @@ mod tests {
             )]
             .into_iter()
             .collect(),
+            missing: Default::default(),
         }
     }
 

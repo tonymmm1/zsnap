@@ -118,6 +118,7 @@ struct RunSummary {
     snapshots_pruned: usize,
     snapshots_protected: usize,
     pools: usize,
+    warnings: Vec<String>,
 }
 
 /// Execution finished but some ZFS commands or hooks failed.
@@ -251,6 +252,7 @@ fn run_zfs_command(cli: &Cli, config: &Config) -> Result<RunSummary> {
     let inventory =
         Inventory::discover(&config.settings, config.datasets.keys().map(String::as_str))?;
     let inventory_elapsed = inventory_started.elapsed();
+    let warnings = missing_dataset_warnings(&inventory);
     let resolved = resolve_datasets(config, &inventory)?;
     let mut plan = build_plan(config, &inventory, &resolved, Utc::now())?;
     filter_plan(&mut plan, scope);
@@ -262,6 +264,7 @@ fn run_zfs_command(cli: &Cli, config: &Config) -> Result<RunSummary> {
             snapshots_pruned: 0,
             snapshots_protected: plan.protected_snapshot_count(),
             pools: plan.pools().len(),
+            warnings,
         });
     }
 
@@ -309,7 +312,23 @@ fn run_zfs_command(cli: &Cli, config: &Config) -> Result<RunSummary> {
         snapshots_pruned: report.snapshots_pruned,
         snapshots_protected: plan.protected_snapshot_count(),
         pools: plan.pools().len(),
+        warnings,
     })
+}
+
+/// Print a warning for each configured section that no longer exists in ZFS.
+fn missing_dataset_warnings(inventory: &Inventory) -> Vec<String> {
+    let warnings: Vec<String> = inventory
+        .missing
+        .iter()
+        .map(|dataset| {
+            format!("configured dataset {dataset:?} does not exist in ZFS; skipped (remove its section from the config if it was deleted)")
+        })
+        .collect();
+    for warning in &warnings {
+        eprintln!("WARNING: {warning}");
+    }
+    warnings
 }
 
 /// Build the success or failure notification for a mutating command.
@@ -345,6 +364,11 @@ fn run_notice(
                     ),
                 ),
             ];
+            if !summary.warnings.is_empty() {
+                notice.headline = format!("zsnap {command} succeeded with warnings");
+                notice.details_heading = format!("Warnings ({})", summary.warnings.len());
+                notice.details = summary.warnings.clone();
+            }
             DeliveryEvent::Success
         }
         Err(error) => {
@@ -421,6 +445,7 @@ fn show_status(config: &Config, refresh: bool, json: bool, verbose: bool) -> Res
         let inventory_started = Instant::now();
         let inventory =
             Inventory::discover(&config.settings, config.datasets.keys().map(String::as_str))?;
+        missing_dataset_warnings(&inventory);
         let cache = StatusCache::from_inventory(
             &inventory,
             config.datasets.keys().cloned(),
@@ -658,6 +683,7 @@ fn check(config: &Config, probe: bool, json: bool) -> Result<()> {
     let (resolved_datasets, pools) = if probe {
         let inventory =
             Inventory::discover(&config.settings, config.datasets.keys().map(String::as_str))?;
+        inventory.require_complete()?;
         let resolved = resolve_datasets(config, &inventory)?;
         (Some(resolved.len()), Some(inventory.pools.len()))
     } else {

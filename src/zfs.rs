@@ -38,6 +38,8 @@ pub struct Inventory {
     pub datasets: BTreeSet<String>,
     pub snapshots: Vec<Snapshot>,
     pub pools: BTreeMap<String, Pool>,
+    /// Configured dataset sections that no longer exist in ZFS; they are skipped.
+    pub missing: BTreeSet<String>,
 }
 
 impl Inventory {
@@ -47,14 +49,9 @@ impl Inventory {
     ) -> Result<Self> {
         let configured_datasets: BTreeSet<_> =
             configured_datasets.into_iter().map(str::to_owned).collect();
-        let configured_pools: BTreeSet<_> = configured_datasets
-            .iter()
-            .map(|dataset| Self::pool_for_dataset(dataset))
-            .map(str::to_owned)
-            .collect();
         // `zfs list -r` already covers descendants, so passing a nested section as well
         // would make ZFS traverse that subtree a second time.
-        let roots: Vec<&String> = configured_datasets
+        let mut roots: Vec<&String> = configured_datasets
             .iter()
             .filter(|dataset| {
                 !configured_datasets
@@ -62,20 +59,54 @@ impl Inventory {
                     .any(|ancestor| is_descendant(dataset, ancestor))
             })
             .collect();
-        let mut dataset_args: Vec<OsString> = vec![
-            "list".into(),
-            "-H".into(),
-            "-p".into(),
-            "-r".into(),
-            "-t".into(),
-            "filesystem,volume".into(),
-            "-o".into(),
-            format!("name,{MANAGED_PROPERTY}").into(),
-        ];
-        dataset_args.extend(roots.iter().map(OsString::from));
         let timeout = settings.zfs_timeout();
-        let datasets_output =
-            run_dataset_list_checked(&settings.zfs_command, &dataset_args, timeout)?;
+        let list_datasets = |roots: &[&String]| -> Result<Result<String, BTreeSet<String>>> {
+            let mut args: Vec<OsString> = vec![
+                "list".into(),
+                "-H".into(),
+                "-p".into(),
+                "-r".into(),
+                "-t".into(),
+                "filesystem,volume".into(),
+                "-o".into(),
+                format!("name,{MANAGED_PROPERTY}").into(),
+            ];
+            args.extend(roots.iter().map(OsString::from));
+            let output = run_output(&settings.zfs_command, &args, timeout)?;
+            if !output.status.success()
+                && let Some(missing) =
+                    parse_missing_datasets(&String::from_utf8_lossy(&output.stderr))
+            {
+                return Ok(Err(missing));
+            }
+            let output = check_output(&settings.zfs_command, &args, output)?;
+            Ok(Ok(String::from_utf8_lossy(&output.stdout).into_owned()))
+        };
+        let mut listing = list_datasets(&roots)?;
+        if let Err(missing) = &listing {
+            // Retry without the roots ZFS reported missing; a second failure is real.
+            roots.retain(|root| !missing.contains(*root));
+            listing = if roots.is_empty() {
+                Ok(String::new())
+            } else {
+                list_datasets(&roots)?
+            };
+        }
+        let datasets = parse_datasets(&listing.map_err(missing_datasets_error)?)?;
+        // Nested sections are not passed to ZFS, so it cannot report them missing.
+        let missing: BTreeSet<String> = configured_datasets
+            .iter()
+            .filter(|dataset| !datasets.contains(*dataset))
+            .cloned()
+            .collect();
+        // With no roots, `zfs list` / `zpool list` would list everything on the host.
+        if roots.is_empty() {
+            return Ok(Self {
+                missing,
+                ..Self::default()
+            });
+        }
+
         let mut snapshot_args: Vec<OsString> = vec![
             "list".into(),
             "-H".into(),
@@ -88,6 +119,10 @@ impl Inventory {
         ];
         snapshot_args.extend(roots.iter().map(OsString::from));
         let snapshots_output = run_checked(&settings.zfs_command, &snapshot_args, timeout)?;
+        let pools: BTreeSet<_> = roots
+            .iter()
+            .map(|root| Self::pool_for_dataset(root))
+            .collect();
         let mut pool_args: Vec<OsString> = vec![
             "list".into(),
             "-H".into(),
@@ -95,25 +130,24 @@ impl Inventory {
             "-o".into(),
             "name,capacity".into(),
         ];
-        pool_args.extend(configured_pools.into_iter().map(OsString::from));
+        pool_args.extend(pools.into_iter().map(OsString::from));
         let pools_output = run_checked(&settings.zpool_command, &pool_args, timeout)?;
-
-        let datasets = parse_datasets(&String::from_utf8_lossy(&datasets_output.stdout))?;
-        // Nested sections are not passed to ZFS, so it cannot report them missing.
-        let missing: BTreeSet<String> = configured_datasets
-            .iter()
-            .filter(|dataset| !datasets.contains(*dataset))
-            .cloned()
-            .collect();
-        if !missing.is_empty() {
-            return Err(missing_datasets_error(missing));
-        }
 
         Ok(Self {
             datasets,
             snapshots: parse_snapshots(&String::from_utf8_lossy(&snapshots_output.stdout))?,
             pools: parse_pools(&String::from_utf8_lossy(&pools_output.stdout))?,
+            missing,
         })
+    }
+
+    /// Fail when any configured section is missing; used by `check --probe`.
+    pub fn require_complete(&self) -> Result<()> {
+        if self.missing.is_empty() {
+            Ok(())
+        } else {
+            Err(missing_datasets_error(self.missing.clone()))
+        }
     }
 
     pub fn pool_for_dataset(dataset: &str) -> &str {
@@ -123,21 +157,6 @@ impl Inventory {
 
 fn run_checked(program: &Path, args: &[OsString], timeout: Option<Duration>) -> Result<Output> {
     let output = run_output(program, args, timeout)?;
-    check_output(program, args, output)
-}
-
-fn run_dataset_list_checked(
-    program: &Path,
-    args: &[OsString],
-    timeout: Option<Duration>,
-) -> Result<Output> {
-    let output = run_output(program, args, timeout)?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        if let Some(missing) = parse_missing_datasets(&stderr) {
-            return Err(missing_datasets_error(missing));
-        }
-    }
     check_output(program, args, output)
 }
 

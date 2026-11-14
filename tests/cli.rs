@@ -713,6 +713,60 @@ esac
 }
 
 #[test]
+fn deleted_datasets_are_skipped_with_a_warning() {
+    let directory = tempdir().unwrap();
+    // Like real ZFS: a missing root fails the whole listing, so zsnap must retry without it.
+    let zfs = r#"#!/bin/sh
+case "$*" in
+  *tank/gone*) echo "cannot open 'tank/gone': dataset does not exist" >&2; exit 1 ;;
+  list*filesystem,volume*) printf 'tank/data\t-\n' ;;
+esac
+"#;
+    let config = fake_host(
+        directory.path(),
+        zfs,
+        "[tank/data]\nhourly = 1\n[tank/gone]\nhourly = 1\n",
+    );
+
+    let plan = Command::new(env!("CARGO_BIN_EXE_zsnap"))
+        .args(["--config", config.to_str().unwrap(), "--json", "plan"])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&plan.stderr);
+    assert!(plan.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("WARNING: configured dataset \"tank/gone\" does not exist"),
+        "{stderr}"
+    );
+    let plan: Value = serde_json::from_slice(&plan.stdout).unwrap();
+    let datasets: Vec<_> = plan["snapshots"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|action| action["dataset"].as_str().unwrap())
+        .collect();
+    assert_eq!(datasets, ["tank/data"]);
+
+    // Only deleted datasets configured: nothing to do, and ZFS is never asked to list everything.
+    let config = fake_host(directory.path(), zfs, "[tank/gone]\n");
+    let plan = Command::new(env!("CARGO_BIN_EXE_zsnap"))
+        .args(["--config", config.to_str().unwrap(), "plan"])
+        .output()
+        .unwrap();
+    assert!(
+        plan.status.success(),
+        "{}",
+        String::from_utf8_lossy(&plan.stderr)
+    );
+
+    let check = Command::new(env!("CARGO_BIN_EXE_zsnap"))
+        .args(["--config", config.to_str().unwrap(), "check", "--probe"])
+        .output()
+        .unwrap();
+    assert!(!check.status.success());
+}
+
+#[test]
 fn notify_test_works_before_any_dataset_is_configured() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     let output = Command::new(env!("CARGO_BIN_EXE_zsnap"))
